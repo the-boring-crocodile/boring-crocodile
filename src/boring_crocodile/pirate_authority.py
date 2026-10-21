@@ -73,8 +73,8 @@ class PirateAuthority:
         protected_path(self.path, os.getuid())
         clear_stale_socket(self.path)
         server = await asyncio.start_unix_server(self.handle, path=self.path, limit=MAX_AUTHORITY_FRAME)
-        bound = bound_identity(self.path)
         os.chmod(self.path, 0o666)  # admission is SO_PEERCRED, not caller-supplied identity
+        bound = bound_identity(self.path)  # after chmod: it changes the change time
         try:
             async with server:
                 yield

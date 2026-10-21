@@ -40,15 +40,20 @@ def clear_stale_socket(path: Path) -> None:
     raise FileExistsError(f"a listener is active at {path}")
 
 
-def bound_identity(path: Path) -> tuple[int, int]:
-    """The socket file a listener just bound, to release it later."""
-    info = path.lstat()
-    return info.st_dev, info.st_ino
+def _identity(info: os.stat_result) -> tuple[int, int, int]:
+    # The inode number alone is not enough: a file system may hand a freed
+    # inode number straight to the next socket bound at the same path.
+    return info.st_dev, info.st_ino, info.st_ctime_ns
 
 
-def release_socket(path: Path, identity: tuple[int, int]) -> None:
+def bound_identity(path: Path) -> tuple[int, int, int]:
+    """The socket file a listener just bound, to release it later. Take it after
+    the last chmod or chown: those change the change time it includes."""
+    return _identity(path.lstat())
+
+
+def release_socket(path: Path, identity: tuple[int, int, int]) -> None:
     """Remove path only while it is still the socket this listener bound."""
     with suppress(FileNotFoundError):
-        current = path.lstat()
-        if (current.st_dev, current.st_ino) == identity:
+        if _identity(path.lstat()) == identity:
             path.unlink()

@@ -35,7 +35,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
+try:
+    import tomllib
+except ImportError:  # Python 3.10
+    import tomli as tomllib
 
 from . import site_setup
 from .settings import Settings
@@ -353,7 +356,6 @@ def told(outcome, config=STATE_DIR / "config.toml") -> str:
         return (f"The site is {outcome['status'].replace('_', ' ')} "
                 f"(health {outcome['local_health']}, site-check {outcome['site_check']}). " + outcome["next"])
     try:
-        import tomllib
         url = tomllib.loads(Path(config).read_text())["server"]["public_base_url"]
     except (OSError, KeyError, ValueError):
         url = "https://YOUR-ADDRESS"

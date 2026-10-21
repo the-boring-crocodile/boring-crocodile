@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import socket
 import tempfile
+import time
 import unittest
 
 from boring_crocodile.sqlite_oauth_provider import pond_resources
@@ -45,7 +46,8 @@ class UnixSocketPathTest(unittest.TestCase):
         identity = bound_identity(self.path)
         first.close()
         self.path.unlink()
-        second = self.bind()  # a successor bound the same path meanwhile
+        time.sleep(0.05)  # later than the kernel's coarse change-time tick
+        second = self.bind()  # a successor bound the same path meanwhile, perhaps with the same inode number
         release_socket(self.path, identity)
         self.assertTrue(self.path.exists())
         release_socket(self.path, bound_identity(self.path))

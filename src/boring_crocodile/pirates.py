@@ -144,7 +144,7 @@ class Pirates:
     def __init__(self, registry: Registry | None = None) -> None:
         self.registry = registry or Registry()
         self.handlers: set[asyncio.Task[None]] = set()
-        self.bound: tuple[Path, tuple[int, int]] | None = None
+        self.bound: tuple[Path, tuple[int, int, int]] | None = None
 
     def register(self, uid: int, request: dict[str, object]) -> dict[str, Any]:
         if (set(request) != {"operation", "kind", "flavour", "socket_path"}
@@ -307,6 +307,7 @@ class Pirates:
         self.bound = (path, bound_identity(path))
         try:
             os.chmod(path, 0o660)
+            self.bound = (path, bound_identity(path))  # after chmod: it changes the change time
             if path.stat().st_gid != gid:
                 raise PermissionError("registration socket did not inherit service group")
         except BaseException:

@@ -327,7 +327,10 @@ def site_controller(config=CONFIG_FILE, receipt=Path("/etc/boring-crocodile/init
     """The Crocodile's account of an existing site, for --add-pond; None if unknown."""
     try:
         if Path(config).exists():
-            import tomllib
+            try:
+                import tomllib
+            except ImportError:  # Python 3.10
+                import tomli as tomllib
             environments = tomllib.loads(Path(config).read_text()).get("environments", {})
             uids = {value.get("control_plane_uid") for value in environments.values()}
             if len(uids) == 1 and None not in uids:

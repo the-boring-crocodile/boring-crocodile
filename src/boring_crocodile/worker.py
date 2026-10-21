@@ -287,8 +287,8 @@ class WorkerServer:
         path.parent.mkdir(parents=True, exist_ok=True)
         clear_stale_socket(path)
         server = await asyncio.start_unix_server(self.handle, path)
-        bound = bound_identity(path)
         os.chmod(path, 0o660)
+        bound = bound_identity(path)  # after chmod: it changes the change time
         registration = None
         # The heartbeats live as long as the worker: they ping every registered
         # Pirate flavour and service and drop the ones that stopped answering.

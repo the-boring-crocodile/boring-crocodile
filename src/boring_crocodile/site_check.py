@@ -30,7 +30,10 @@ import pwd
 import stat
 import subprocess
 import sys
-import tomllib
+try:
+    import tomllib
+except ImportError:  # Python 3.10
+    import tomli as tomllib
 from pathlib import Path
 
 from .settings import Settings

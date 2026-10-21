@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "boring-crocodile-mcp"
-version = "0.4.14"
+version = "0.4.15"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE", "COPYING.md"]
 description = "Authenticated MCP access to isolated personal workspaces"
@@ -15,10 +15,10 @@ dependencies = [
     "starlette>=1.6,<2",
     "httpx2>=2.13,<2.14",
     "boring-task-state==0.3.5",
-    "boring-file-core>=0.7.5,<0.8",
-    "boring-worker-kit>=0.7.5,<0.8",
-    "boring-registry>=0.7.5,<0.8",
-    "boring-service-kit>=0.7.5,<0.8",
+    "boring-file-core>=0.7.6,<0.8",
+    "boring-worker-kit>=0.7.6,<0.8",
+    "boring-registry>=0.7.6,<0.8",
+    "boring-service-kit>=0.7.6,<0.8",
     "tomli>=2.2; python_version < '3.11'",
     "exceptiongroup>=1.3; python_version < '3.11'",
 ]
