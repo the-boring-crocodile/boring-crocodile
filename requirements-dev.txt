@@ -1,4 +1,4 @@
 # Development-only tools; never part of the service runtime.
 mypy==1.18.2
-pytest==8.4.2
+pytest==9.0.3
 tomli==2.2.1
