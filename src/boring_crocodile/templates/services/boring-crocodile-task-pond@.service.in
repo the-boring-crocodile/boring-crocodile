@@ -1,0 +1,18 @@
+[Unit]
+PartOf=boring-crocodile-mcp.target
+Description=Boring Crocodile @POND@ command task
+CollectMode=inactive-or-failed
+[Service]
+Type=exec
+Slice=@BUDGET@
+User=@EXECUTION_USER@
+Group=@EXECUTION_USER@
+UMask=0077
+ExecStart=@RUNTIME@/bin/boring-crocodile-task --config /etc/boring-crocodile/config.toml --environment @POND@
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+KillMode=control-group
+TimeoutStopSec=1s
+@TASK_POLICY@
+TasksMax=@TASK_TASKS@

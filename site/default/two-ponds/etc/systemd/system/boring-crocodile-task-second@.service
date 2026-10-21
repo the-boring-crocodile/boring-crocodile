@@ -1,0 +1,27 @@
+[Unit]
+PartOf=boring-crocodile-mcp.target
+Description=Boring Crocodile second command task
+CollectMode=inactive-or-failed
+[Service]
+Type=exec
+Slice=system-crocodilesecond.slice
+User=boring-crocodile-second
+Group=boring-crocodile-second
+UMask=0077
+ExecStart=/opt/boring-crocodile/current/bin/boring-crocodile-task --config /etc/boring-crocodile/config.toml --environment second
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+KillMode=control-group
+TimeoutStopSec=1s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=
+ReadWritePaths=/home/boring-crocodile-second
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=no
+LockPersonality=yes
+TasksMax=128

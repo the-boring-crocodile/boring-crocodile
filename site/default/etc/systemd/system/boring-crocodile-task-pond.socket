@@ -1,0 +1,15 @@
+[Unit]
+PartOf=boring-crocodile-mcp.target
+Description=Boring Crocodile fixed-identity pond task launcher
+Requires=system-crocodilepond.slice
+After=system-crocodilepond.slice
+[Socket]
+ListenStream=/run/boring-crocodile/tasks/pond.sock
+SocketUser=boring-crocodile
+SocketGroup=boring-crocodile
+SocketMode=0600
+DirectoryMode=0755
+Accept=yes
+RemoveOnStop=yes
+[Install]
+WantedBy=boring-crocodile-mcp.target

@@ -1,0 +1,34 @@
+# Secrets and credentials
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime residue
+*.log
+*.pid
+*.sock
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+*.egg-info/
+build/
+dist/
+
+# Shared, hash-pinned candidate copies; manifest and handoff remain tracked
+/artifacts/*/*.whl
+.deps/

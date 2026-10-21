@@ -1,0 +1,34 @@
+[Unit]
+PartOf=boring-crocodile-mcp.target
+Description=Boring Crocodile MCP control plane
+After=network-online.target boring-crocodile-worker-pond.service
+Wants=network-online.target
+Requires=boring-crocodile-worker-pond.service
+
+[Service]
+Type=simple
+RuntimeDirectory=boring-crocodile-authority
+RuntimeDirectoryMode=0755
+StateDirectory=boring-crocodile
+StateDirectoryMode=0700
+UMask=0077
+User=boring-crocodile-mcp
+Group=boring-crocodile-mcp
+SupplementaryGroups=boring-crocodile
+Environment=BORING_CROCODILE_CONFIG=/etc/boring-crocodile/config.toml
+LoadCredential=approval-secret:/etc/boring-crocodile/credentials/approval-secret
+ExecStart=/opt/boring-crocodile/current/bin/boring-crocodile-mcp
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/boring-crocodile
+CapabilityBoundingSet=
+LockPersonality=yes
+RestrictSUIDSGID=yes
+TasksMax=64
+
+[Install]
+WantedBy=boring-crocodile-mcp.target

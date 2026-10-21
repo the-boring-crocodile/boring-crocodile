@@ -1,0 +1,15 @@
+[Unit]
+PartOf=boring-crocodile-mcp.target
+Description=Boring Crocodile fixed-identity second task launcher
+Requires=system-crocodilesecond.slice
+After=system-crocodilesecond.slice
+[Socket]
+ListenStream=/run/boring-crocodile/tasks/second.sock
+SocketUser=boring-crocodile-second
+SocketGroup=boring-crocodile-second
+SocketMode=0600
+DirectoryMode=0755
+Accept=yes
+RemoveOnStop=yes
+[Install]
+WantedBy=boring-crocodile-mcp.target

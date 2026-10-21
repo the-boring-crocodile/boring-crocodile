@@ -1,0 +1,25 @@
+[Unit]
+PartOf=boring-crocodile-mcp.target
+Description=Boring Crocodile pond environment worker
+After=systemd-tmpfiles-setup.service local-fs.target boring-crocodile-task-pond.socket
+
+[Service]
+Type=simple
+User=boring-crocodile
+Group=boring-crocodile
+UMask=0007
+ExecStart=/opt/boring-crocodile/current/bin/boring-crocodile-worker --config /etc/boring-crocodile/config.toml --environment pond
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/boring-crocodile/workers /home/boring-crocodile
+CapabilityBoundingSet=
+LockPersonality=yes
+RestrictSUIDSGID=yes
+TasksMax=128
+
+[Install]
+WantedBy=boring-crocodile-mcp.target

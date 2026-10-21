@@ -1,0 +1,8 @@
+[Unit]
+Description=Boring Crocodile configured site
+ConditionPathExists=/etc/boring-crocodile/config.toml
+Requires=boring-crocodile-mcp.service
+After=boring-crocodile-mcp.service
+
+[Install]
+WantedBy=multi-user.target
