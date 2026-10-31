@@ -19,6 +19,12 @@ from boring_worker_kit.observation import Observation
 from .pirates import Pirates, registration_path
 from boring_worker_kit.services import Services, ServiceFailure
 from boring_worker_kit.files import FileTools
+
+from boring_worker_kit.deadlines import REPLY_MARGIN_SECONDS, SERVICE_OPERATION_SECONDS, budget, deadline_after
+from boring_worker_kit.file_refs import call_service
+from boring_worker_kit.host_limits import FOREGROUND_REQUEST_SECONDS
+from boring_worker_kit.services import CALL_TIMEOUT_SECONDS
+from .pirates import REQUEST_TIMEOUT as PIRATE_REQUEST_SECONDS
 from .batch import BatchRunner, FILE_METHODS, JOB_METHODS, SERVICE_METHODS
 from boring_worker_kit.inputs import MAX_JOB_SECONDS
 from .jobs import DEFAULT_JOB_SECONDS
@@ -68,7 +74,7 @@ class WorkerServer:
                       "max_foreground_seconds": min(103.0, self.limits.exec_timeout_seconds) if self.limits else 103.0,
                       "methods": sorted(FILE_METHODS | (JOB_METHODS if self.jobs else frozenset()) |
                                         ({"exec"} if self.executor else set()) |
-                                        SERVICE_METHODS),
+                                        SERVICE_METHODS | {"service_call"}),
                       "job_default_timeout_seconds": DEFAULT_JOB_SECONDS if self.jobs else None,
                       "job_max_timeout_seconds": MAX_JOB_SECONDS if self.jobs else None},
         }
@@ -120,9 +126,27 @@ class WorkerServer:
                     wait_seconds = max(0.0, min(wait_seconds, remaining - BATCH_STEP_MARGIN))
                 return await self.jobs.wait(args.get("job_ids"), wait_seconds)
             return getattr(self.jobs, method.removeprefix("job_"))(args.get("job_id"))
+        if method == "service_call":
+            # Inside a batch the step ends REPLY_MARGIN_SECONDS before the batch's own deadline,
+            # so its save (or refusal) is reported by the step instead of being cut off by the
+            # batch: a service that ran never loses its answer to the outer deadline.
+            limit = deadline_after(SERVICE_OPERATION_SECONDS)
+            return await self.service_call(args, limit if deadline is None
+                                           else min(deadline - REPLY_MARGIN_SECONDS, limit))
         if method in SERVICE_METHODS:
             return self.services.list()
         raise Refusal("invalid_request", "unsupported batch operation")
+
+    async def service_call(self, request: dict[str, object], deadline: float) -> dict[str, object]:
+        """One service call, from the service_call tool or a batch step, within `deadline`.
+        File references and save_to are resolved here, where the Pond's file roots are
+        (the worker kit's call_service); the service sees plain arguments."""
+        service, tool, token = request.get("service"), request.get("tool"), request.get("token")
+
+        async def call(arguments: object, timeout: float) -> dict[str, object]:
+            return await self._observed("service", "service_call", service, tool,
+                                        self.services.call(service, tool, arguments, token, timeout=timeout))
+        return await call_service(self.files, request.get("arguments"), request.get("save_to"), call, deadline)
 
     async def _observed(self, kind: str, method: str, target: object, detail: object,
                         work: Awaitable[dict]) -> dict:
@@ -174,6 +198,9 @@ class WorkerServer:
             operation = request.get("operation")
             if not isinstance(operation, str):
                 raise Refusal("invalid_request", "operation is required")
+            # The control plane's budget for this request (deadlines.py); each
+            # operation caps it by its own limit.
+            carried = request.pop("budget_seconds", None)
             if operation == "bootstrap":
                 if self.context is None:
                     raise RuntimeError("No context configured for this worker")
@@ -185,7 +212,13 @@ class WorkerServer:
                 result = await asyncio.to_thread(self.context.load, project)
                 result["capabilities"] = self._capabilities()
             elif operation == "batch":
-                execution = asyncio.create_task(self.batch.run(request.get("batch")))
+                tokens = request.get("service_tokens")
+                if tokens is not None and (not isinstance(tokens, dict) or not all(
+                        isinstance(k, str) and isinstance(v, str) for k, v in tokens.items())):
+                    raise Refusal("invalid_request", "service_tokens must map step IDs to tokens")
+                execution = asyncio.create_task(self.batch.run(
+                    request.get("batch"), service_tokens=tokens,
+                    foreground_cap=budget(carried, float(FOREGROUND_REQUEST_SECONDS))))
                 disconnected = asyncio.create_task(reader.read(1))
                 done, _ = await asyncio.wait((execution, disconnected), return_when=asyncio.FIRST_COMPLETED)
                 if disconnected in done:
@@ -193,11 +226,17 @@ class WorkerServer:
                 result = await execution
             elif operation == "limits":
                 result = self._command_limits()
-            elif operation in ("service_describe", "service_call"):
-                result = await self._observed(
-                    "service", operation, request.get("service"),
-                    request.get("tool") if operation == "service_call" else None,
-                    self.services.dispatch(request))
+            elif operation == "service_call":
+                if set(request) - {"operation", "request_id"} not in ({"service", "tool", "arguments", "token"},
+                                                                     {"service", "tool", "arguments", "token", "save_to"}):
+                    raise Refusal("invalid_request", "invalid service worker envelope")
+                result = await self.service_call(request, deadline_after(budget(carried, SERVICE_OPERATION_SECONDS)))
+            elif operation == "service_describe":
+                if set(request) - {"operation", "request_id"} != {"service", "token"}:
+                    raise Refusal("invalid_request", "invalid service worker envelope")
+                result = await self._observed("service", operation, request.get("service"), None,
+                                              self.services.describe(request["service"], request["token"],
+                                                                     timeout=budget(carried, CALL_TIMEOUT_SECONDS)))
             elif operation in ("service_register", "service_list", "service_forget"):
                 result = await self.services.dispatch(request)
             elif operation == "list_pirates":
@@ -205,7 +244,8 @@ class WorkerServer:
             elif operation == "pirate_describe":
                 execution = asyncio.create_task(self._observed(
                     "pirate", operation, request.get("pirate"), request.get("flavour"),
-                    self.pirates.describe(request.get("pirate"), request.get("flavour"))))
+                    self.pirates.describe(request.get("pirate"), request.get("flavour"),
+                                          budget(carried, PIRATE_REQUEST_SECONDS))))
                 # The control plane gives up after its own deadline; do not keep
                 # waiting on the Pirate for a caller that has gone.
                 disconnected = asyncio.create_task(reader.read(1))
@@ -237,6 +277,7 @@ class WorkerServer:
                 execution = asyncio.create_task(self.executor.execute(
                     request.get("command"), request.get("cwd"),
                     request.get("timeout_seconds"),
+                    foreground_deadline=deadline_after(budget(carried, float(FOREGROUND_REQUEST_SECONDS))),
                 ))
                 # Foreground EOF cancels only ordinary exec, never a managed job.
                 disconnected = asyncio.create_task(reader.read(1))

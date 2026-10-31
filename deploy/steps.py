@@ -111,8 +111,26 @@ def check(ctx):
         return
     ponds = _admin(ctx, ctx.new, "list").stdout
     ctx.log(f"configuration parses with the new release: {len(json.loads(ponds))} Ponds")
+    _render_due(ctx)
     if (ctx.home / "current" / "bin" / "boring-crocodile-admin").exists():
         _before.update(_checks(ctx, ctx.home / "current"))
+
+
+def _render_due(ctx):
+    """Say when the new release renders site files differently (the deploy writes
+    none of them): site-check of the new release on the live files. Informational."""
+    admin = str(Path(ctx.new) / "bin" / "boring-crocodile-admin")
+    result = ctx.run(admin, "--config", str(_config(ctx)), "site-check", "--json", check=False)
+    try:
+        report = json.loads(result.stdout)
+    except ValueError:
+        return
+    due = [item["path"] for item in report.get("irregular", [])
+           if item.get("what") in ("differs from the Crocodile's template", "file missing") and "path" in item]
+    if due:
+        ctx.log(f"{len(due)} site files differ from what the new release renders "
+                f"({', '.join(Path(p).name for p in due[:4])}{', ...' if len(due) > 4 else ''}); "
+                "the deploy changes none: afterwards, boring-crocodile-setup --site-render shows the plan")
 
 
 def healthy(ctx):

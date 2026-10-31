@@ -10,7 +10,7 @@ def load_shared_guide() -> dict[str, str]:
         "templates/CAPABILITIES.md").read_bytes()
     return {
         "filename": "CAPABILITIES.md",
-        "version": "20",
+        "version": "23",
         "sha256": hashlib.sha256(content).hexdigest(),
         "content": content.decode("utf-8"),
     }

@@ -21,10 +21,10 @@ try:
     import boring_registry, boring_file_core, boring_service_kit, boring_worker_kit  # noqa: F401
 except ImportError as missing:
     sys.exit(f"Pond Common is not installed in {sys.executable}: {missing.name}")
-env["PYTHONPATH"] = os.pathsep.join((str(root / "src"), str(root / "packages/boring-task-state/src"), str(root / "tests"), env.get("PYTHONPATH", "")))
+env["PYTHONPATH"] = os.pathsep.join((str(root / "src"), str(root / "tests"), env.get("PYTHONPATH", "")))
 commands = {
     "unit": [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
-    "cleanup": [sys.executable, "-m", "unittest", "test_task_client", "test_containment_recovery", "test_execution", "test_batch", "test_jobs"],
+    "cleanup": [sys.executable, "-m", "unittest", "test_batch", "test_jobs"],
     "setup": [sys.executable, "-m", "unittest", "tests.test_setup", "tests.test_setup_apply", "tests.test_setup_additional", "tests.test_setup_services", "tests.test_uninstall", "tests.test_site_setup"],
 }
 command = commands[args.profile]

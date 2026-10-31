@@ -18,22 +18,25 @@ attrs==26.1.0 \
     # via
     #   jsonschema
     #   referencing
-boring-file-core==0.7.6 \
-    --hash=sha256:0355a2f4a9cc7886c897896e9d19c970e651c66e9cf90dc958cdb11ea3f7e634
+boring-deploy==0.7.11 \
+    --hash=sha256:941445e26d6886d2a5cbe8a13943e519366ae332cd6f1bd982078bcc036aa17f
+    # via boring-crocodile-mcp (pyproject.toml)
+boring-file-core==0.7.11 \
+    --hash=sha256:6b0bdc831b783915860e78cf02f747ff155afaed85afba0ff07fd1605f95addb
     # via
     #   boring-crocodile-mcp (pyproject.toml)
     #   boring-worker-kit
-boring-registry==0.7.6 \
-    --hash=sha256:6da09430b52e59691cb353f1e85b70cc092faf776a39e79e365faebf0178ddb0
+boring-registry==0.7.11 \
+    --hash=sha256:9172df0feffe48215470ab5cc48e3ee9ff6ca36cf53a9532c2e30e4bb5d472fe
     # via
     #   boring-crocodile-mcp (pyproject.toml)
     #   boring-service-kit
     #   boring-worker-kit
-boring-service-kit==0.7.6 \
-    --hash=sha256:3c65072266e55919413bce86da54342349a81f7a48fcf2b0fccb5f8a1ec34b55
+boring-service-kit==0.7.11 \
+    --hash=sha256:592f44c3cb90000db6b944c378b4e5335dde6851bfaba32f730dfbf0ee73c1a2
     # via boring-crocodile-mcp (pyproject.toml)
-boring-worker-kit==0.7.6 \
-    --hash=sha256:ce672cad0fd28813bd354cc04c0c6bddd14186c50e3738d7d50175d28b534b14
+boring-worker-kit==0.7.11 \
+    --hash=sha256:ff8d822337bc902ac73dba057e29f60f0442ce476fea4bc1eb335e35cf4166c9
     # via boring-crocodile-mcp (pyproject.toml)
 cffi==2.1.1 ; platform_python_implementation != 'PyPy' \
     --hash=sha256:046bfc24911b37851ee1b51aab8bffe713d89c68c6a057b09484ce9fd5f69b4e \
@@ -632,6 +635,3 @@ uvicorn==0.54.0 \
     # via
     #   boring-service-kit
     #   mcp
-
-# The following packages were excluded from the output:
-# boring-task-state

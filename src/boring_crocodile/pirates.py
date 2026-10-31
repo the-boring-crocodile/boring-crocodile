@@ -30,6 +30,8 @@ from typing import Any
 
 from boring_registry import Entry, Registry
 
+from boring_worker_kit.deadlines import REPLY_MARGIN_SECONDS
+from boring_worker_kit.host_limits import TASK_OVERHEAD_SECONDS
 from boring_worker_kit.framing import peer_uid
 from boring_worker_kit.inputs import MAX_JOB_SECONDS
 from .outcomes import Refusal, is_code
@@ -46,10 +48,16 @@ MAX_FLAVOURS = 64
 MAX_REGISTRATIONS = 16
 REQUEST_TIMEOUT = 5.0
 # The Pirate enforces the assignment's own timeout (null: its default). The
-# worker only stops holding the connection a little later, for a Pirate that
-# never answers; with null it assumes the longest job, MAX_JOB_SECONDS.
-RUN_MARGIN_SECONDS = 10.0
+# worker only stops holding the connection RUN_MARGIN_SECONDS later, for a
+# Pirate that never answers; with null it assumes the longest job, MAX_JOB_SECONDS.
+# At its deadline the Pirate cancels a running tool, whose command may still use
+# the executor's cleanup reserve, then writes its transcript and answers: so the
+# margin is that reserve plus the reply margin, not the reply margin alone.
+RUN_MARGIN_SECONDS = TASK_OVERHEAD_SECONDS + REPLY_MARGIN_SECONDS
 RUN_KEYS = {"pirate", "flavour", "assignment", "timeout_seconds"}
+# Optional per-call overrides of a flavour (Pirates PF1), passed through unchanged:
+# the Pirate checks them against the flavour (allow_overrides, its tools, its caps).
+MAX_OVERRIDES_BYTES = 64 * 1024
 
 
 def registration_path(environment: str) -> Path:
@@ -97,11 +105,18 @@ def answer(response: dict[str, Any]) -> dict[str, Any]:
 
 async def exchange(path: str, uid: int, request: dict[str, object],
                    timeout: float) -> dict[str, Any]:
-    """One request, one answer, on a connection to the Pirate's socket."""
+    """One request, one answer, on a connection to the Pirate's socket, all within
+    `timeout` seconds (one deadline for connecting, sending and the answer)."""
+    if timeout <= 0:
+        raise Refusal("limit", "no time left to ask the Pirate; nothing was sent")
     payload = encode(request)
+    end = asyncio.get_running_loop().time() + timeout
+
+    def remaining() -> float:
+        return max(0.0, end - asyncio.get_running_loop().time())
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(path, limit=MAX_FRAME), timeout)
+            asyncio.open_unix_connection(path, limit=MAX_FRAME), remaining())
     except (FileNotFoundError, ConnectionRefusedError):
         raise Refusal("unavailable", "the Pirate is not listening") from None
     except asyncio.TimeoutError:
@@ -112,12 +127,12 @@ async def exchange(path: str, uid: int, request: dict[str, object],
             raise PermissionError("the Pirate socket is served by another account")
         writer.write(payload)
         try:
-            await asyncio.wait_for(writer.drain(), timeout)
+            await asyncio.wait_for(writer.drain(), remaining())
         except asyncio.TimeoutError:
             raise TimeoutError(f"the Pirate did not take the request within {timeout:g} s; "
                                "it may have received part of it") from None
         try:
-            line = await asyncio.wait_for(reader.readline(), timeout)
+            line = await asyncio.wait_for(reader.readline(), remaining())
         except ValueError:  # StreamReader's limit: the frame is too long
             raise ValueError(
                 f"the Pirate's answer exceeds the frame limit of {MAX_FRAME} bytes; "
@@ -205,16 +220,26 @@ class Pirates:
             raise Refusal("not_found", "no such Pirate flavour is registered with this Pond")
         return entry
 
-    async def describe(self, pirate: object, flavour: object) -> dict[str, Any]:
+    async def describe(self, pirate: object, flavour: object,
+                       timeout: float = REQUEST_TIMEOUT) -> dict[str, Any]:
+        """The flavour's own description, within `timeout` (the carried budget, at most
+        REQUEST_TIMEOUT) for the whole exchange."""
         entry = self._entry(pirate, flavour)
         return await exchange(entry.details["socket_path"], entry.details["uid"],
-                              {"operation": "describe", "flavour": flavour}, REQUEST_TIMEOUT)
+                              {"operation": "describe", "flavour": flavour}, min(timeout, REQUEST_TIMEOUT))
 
     def prepare_run(self, payload: object) -> dict[str, Any]:
         """Check a job's `pirate` payload before the job exists."""
-        if not isinstance(payload, dict) or set(payload) != RUN_KEYS:
+        if not isinstance(payload, dict) or not RUN_KEYS <= set(payload) <= RUN_KEYS | {"overrides"}:
             raise Refusal("invalid_request",
-                          "pirate needs exactly pirate, flavour, assignment and timeout_seconds")
+                          "pirate needs exactly pirate, flavour, assignment and timeout_seconds "
+                          "(and optionally overrides)")
+        overrides = payload.get("overrides")
+        if overrides is not None:
+            if not isinstance(overrides, dict):
+                raise Refusal("invalid_request", "overrides must be an object or null")
+            if len(json.dumps(overrides, ensure_ascii=False).encode()) > MAX_OVERRIDES_BYTES:
+                raise Refusal("limit", f"overrides exceed {MAX_OVERRIDES_BYTES} bytes")
         assignment, timeout = payload["assignment"], payload["timeout_seconds"]
         if not isinstance(assignment, str) or not assignment.strip():
             raise Refusal("invalid_request", "assignment must be nonempty text")
@@ -235,6 +260,8 @@ class Pirates:
         request: dict[str, object] = {
             "operation": "run", "flavour": target["flavour"], "job_id": job_id,
             "assignment": target["assignment"], "timeout_seconds": target["timeout_seconds"]}
+        if target.get("overrides") is not None:  # absent on the wire otherwise: an older Pirate refuses it
+            request["overrides"] = target["overrides"]
         encode(request)
         return request
 

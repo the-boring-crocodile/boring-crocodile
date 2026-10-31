@@ -12,14 +12,14 @@ import time
 import threading
 
 from boring_service_kit.issuer import ClientPolicy
-from boring_service_kit.issuer.web import replace_metadata_routes
+from boring_service_kit.issuer.web import configure_issuer_routes
 from boring_service_kit.tools import argument_problems, lean_schema
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser, BearerAuthBackend, RequireAuthMiddleware
 from mcp.server.auth.provider import AccessToken, ProviderTokenVerifier, TokenVerifier
 from mcp.server.auth.routes import build_resource_metadata_url, create_protected_resource_routes
-from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
@@ -44,10 +44,16 @@ from .settings import PondSettings, Settings
 from .worker_client import WorkerClient
 
 logger = logging.getLogger(__name__)
-# Tokens minted for a worker's calls to a service: short-lived, reused per
-# (Pond, service) until shortly before they expire.
-SERVICE_TOKEN_SECONDS = 300
-SERVICE_TOKEN_RENEW_SECONDS = 60
+# Tokens minted for a worker's calls to a service, reused per (Pond, service)
+# until less than SERVICE_TOKEN_RENEW_SECONDS are left: more than any foreground
+# request (a batch, 103 s) needs, so one rule serves single calls and batch steps.
+# The token goes to the service with each call (over HTTPS); the service
+# introspects it, the control plane checks the live grant at every
+# introspection, and services cache a positive answer for at most 60 s. So a
+# revoked grant ends within a minute; the life only bounds how long a token
+# that leaked from a service or proxy stays usable against that one service.
+SERVICE_TOKEN_SECONDS = 3600
+SERVICE_TOKEN_RENEW_SECONDS = 900
 # Where the SDK puts its own transport route; create_http_app removes it.
 SDK_TRANSPORT_PATH = "/mcp"
 
@@ -182,6 +188,7 @@ def create_control_plane(settings: Settings, provider: SQLiteOAuthProvider | Non
                 valid_scopes=["mcp"],
                 default_scopes=["mcp"],
             ),
+            revocation_options=RevocationOptions(enabled=True),
             validate_token_resource=False,
         ),
     )
@@ -288,16 +295,22 @@ def create_control_plane(settings: Settings, provider: SQLiteOAuthProvider | Non
         return await workers.service_describe(environment, service, token)
 
     @mcp.tool()
-    async def service_call(service: str, tool: str, arguments: dict[str, object]) -> dict[str, object]:
+    async def service_call(service: str, tool: str, arguments: dict[str, object],
+                           save_to: dict[str, object] | None = None) -> dict[str, object]:
         """Call one tool of a service; service_describe lists them. The service validates the arguments.
 
-        A refusal from the service arrives with the service's own code. The
-        service has 30 s to answer; a call that timed out or whose connection
-        failed may have run (check before repeating a write); it is not
-        repeated for you.
+        Content need not pass through you: any argument value may be
+        {"$file": {"root", "path", "sha256"?}}, replaced by that file's text;
+        save_to {"root", "path", "expected_sha256"} writes the answer to a
+        file and returns `saved_to` instead (save_to_refused / save_to_failed
+        with the answer when the save does not succeed; see the guide). A
+        refusal from the service arrives with the service's own code. The
+        service has at most 30 s to answer; a call that timed out or whose
+        connection failed may have run (check before repeating a write); it
+        is not repeated for you.
         """
         environment, token = await granted_service(service)
-        return await workers.service_call(environment, service, tool, arguments, token)
+        return await workers.service_call(environment, service, tool, arguments, token, save_to)
 
     @mcp.tool(annotations=ToolAnnotations(
         read_only_hint=True, destructive_hint=False, idempotent_hint=True,
@@ -315,7 +328,7 @@ def create_control_plane(settings: Settings, provider: SQLiteOAuthProvider | Non
 
     register_file_tools(mcp, workers, selected_environment)
 
-    register_task_tools(mcp, workers, selected_environment, command_environment, visible_batch)
+    register_task_tools(mcp, workers, selected_environment, command_environment, visible_batch, granted_service)
 
     register_auth_routes(mcp, settings, provider, workers)
 
@@ -420,7 +433,7 @@ def create_http_app(settings: Settings) -> tuple[MCPServer, Starlette]:
     if len(sdk_routes) != 1:
         raise RuntimeError("SDK app has no single transport route to retire")
     app.router.routes.remove(sdk_routes[0])
-    replace_metadata_routes(app, provider)  # advertises metadata documents (CIMD)
+    configure_issuer_routes(app, provider)  # CIMD metadata and SDK revocation compatibility
     issuer = AnyHttpUrl(settings.public_base_url)
     resource_by_path: dict[str, str] = {}
     handler = StreamableHTTPASGIApp(control_plane.session_manager)

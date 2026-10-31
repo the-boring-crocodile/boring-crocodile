@@ -1,9 +1,11 @@
 # The admin command
 
 `boring-crocodile-admin` is how a root administrator looks at and changes a
-running site. Commands that change something show a plan first and apply only
-with `--apply` and the plan's `--approve-digest` (a changed site makes the
-digest stale: plan again). `--config PATH` goes before the command.
+running site. Site changes and grant/client removals show a plan first and
+apply only with `--apply` and the plan's `--approve-digest` (a changed site makes
+the digest stale: plan again). `oauth client-add` creates a client immediately;
+`oauth backup` immediately writes a new private backup. `--config PATH` goes
+before the command.
 
 | Command | |
 |---|---|

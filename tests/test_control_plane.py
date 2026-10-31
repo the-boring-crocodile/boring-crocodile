@@ -32,7 +32,7 @@ class ControlPlaneTest(unittest.TestCase):
             )
 
             # The service call deadline is stated where the caller reads it.
-            self.assertIn(f"has {CALL_TIMEOUT_SECONDS:g} s to answer",
+            self.assertIn(f"has at most {CALL_TIMEOUT_SECONDS:g} s",
                           tools["service_call"].description)
             self.assertIn("may have run", tools["service_call"].description)
 

@@ -42,6 +42,11 @@ contact only admin-approved URLs.
   next introspection (services may cache a positive answer for up to 60 s).
   Neither pushes the change into workers' registries: make the service
   register again (restart it) and check that each worker sees it.
+- A grant here is necessary, not always sufficient: a service that keeps its
+  own caller list (boring-knowledge and boring-sourcecache-d365: `access` in
+  their `config.json`) refuses the token ("the service rejected the call
+  token") until the caller is listed there too, e.g.
+  `{"subject": "pirate/NAME", "role": "reader"}`, and the service restarted.
 - `service-remove NAME` also deletes its tokens; `--expected-definition JSON`
   removes only if the record still matches. A new ping timeout needs remove
   and add.
@@ -69,11 +74,15 @@ a ping and delay a re-registration; no access is gained.
 ### Calls carry a minted token
 
 For `service_describe` and `service_call` the controller mints a token:
-subject the Pond, resource the service's URL, 300 s, stored hashed as its own
-kind (never valid as an agent token, nor the reverse), reused until 60 s
-before expiry. The agent's own token never leaves the controller. The worker
-sends one stateless Streamable HTTP request per call. That is why `batch` and
-job `operations` allow only `service_list`.
+subject the Pond, resource the service's URL, 3600 s, stored hashed as its own
+kind (never valid as an agent token, nor the reverse), reused while more than
+900 s are left, so a token handed out always outlives the longest foreground
+request. The agent's own token never leaves the controller. The worker sends
+one stateless Streamable HTTP request per call. A `batch` may hold
+`service_call` steps because the controller checks the grants and mints their
+tokens before the batch starts; job `operations` allow only `service_list`,
+since a job can outlive any token. (Pirates' own service calls use separate 60 s
+tokens from the local authority; this rule is for the Pond's calls.)
 
 The service checks the token at `POST /introspect` (RFC 7662, HTTP Basic with
 its own credentials, body `token=...`): `{"active": true, "sub": POND, "aud":
@@ -88,8 +97,9 @@ never passes the token on.
   grant takes effect at once). One ping that merely ran out of time keeps
   `available`.
 - `service_describe(service)`: `{"service", "tools": [...]}`.
-- `service_call(service, tool, arguments)`: `{"content": [...],
-  "structuredContent": {...}}`.
+- `service_call(service, tool, arguments, save_to?)`: `{"content": [...],
+  "structuredContent": {...}}`, or with `save_to` the `saved_to` record (see
+  below).
 
 | Outcome | When |
 |---|---|
@@ -99,10 +109,39 @@ never passes the token on.
 | `tool_error` | any other tool error, with the service's text |
 | `forbidden` | HTTP 401/403: the service rejected the call token |
 | `service_error` | another JSON-RPC error, with `service_code` |
-| a failure | no answer in 30 s, or the connection dropped after sending: it may have run, and it is never re-sent |
+| `limit` | no time left for the call (nothing sent); or more than 16 file references or 512 KiB of them |
+| `stale`, `not_found`, `forbidden`, `invalid_request` | a file reference or the save target was refused before the call (nothing sent) |
+| a failure | no answer in time (at most 30 s), or the connection dropped after sending: it may have run, and it is never re-sent |
 
 A service's failed outcome stays a failure with its details; it is not turned
 into a refusal.
+
+### File references and save_to
+
+`service_call` resolves `{"$file": {"root", "path", "sha256"?}}` in its
+arguments to the file's text and, with `save_to`, writes the answer to a file
+and returns `saved_to` instead of the answer. Both happen in the worker
+through its file tools (the worker kit's `file_refs`, which Pirates use too),
+so the file policy decides what may be read and written; the service sees
+plain arguments and never a path. After the service ran, a save that does not
+succeed returns the answer with `save_to_refused` (nothing written) or
+`save_to_failed` (`effects: unknown`: the write failed or did not finish in
+time and may still land). Inside a batch that step is `failed` with `code`
+(the save outcome's name) and keeps the answer in its `result`, so `on_error:
+stop` stops before a step that would rely on the file (review finding F1, 2026-10-25).
+The agent-facing rules are in the guide.
+
+### Time
+
+Every request from the controller to a worker carries its budget
+(`budget_seconds`); the worker caps it per operation and the controller waits
+the budget plus a 5 s reply margin, so the worker's own deadline, which says
+what may have run, is what the caller sees. A single `service_call` has 45 s:
+the service's 30 s plus reading references and saving. Inside a batch a
+service step ends 5 s before the batch does, so its save is reported by the
+step and never cut off. The controller and its workers must run the same
+release: a worker of 0.4.16rc2 or older refuses frames that carry a budget
+(the deploy restarts them together).
 
 ## Pirates
 
@@ -113,7 +152,9 @@ A Pirate's own installer runs `boring-crocodile-admin pirate-add NAME
 account joins `pond-pirates` (may register), the Ponds' workers join
 `pirate-clients` (may call it), and it becomes a service caller
 (`[pirate_services.callers]`). Only Ponds with `service_registration_enabled`
-accept Pirates. Nothing about a Pirate's flavours is in `config.toml`. A
+accept Pirates; a running Pond starts accepting them with
+`boring-crocodile-setup --site-render --guests POND` (create `pond-pirates`
+first). Nothing about a Pirate's flavours is in `config.toml`. A
 Pirate serves every Pond it is added for with its own grants:
 [boring-pirates](https://github.com/the-boring-crocodile/boring-pirates/blob/main/README.md#installing-a-pirate).
 
@@ -159,14 +200,20 @@ job (the run may have done its work).
   inactive: `not_found`.
 - `{"operation": "describe", "flavour": F}` -> the flavour's summary.
 - `{"operation": "run", "flavour": F, "job_id": HEX32, "assignment": TEXT,
-  "timeout_seconds": N|null}` -> held open until the single answer.
+  "timeout_seconds": N|null}`, and optionally `"overrides": {...}` -> held open
+  until the single answer. The worker sends `overrides` only when the job has
+  them; the Pirate checks them against the flavour (`allow_overrides`, its
+  tools and services, its caps) and refuses what the flavour cannot take. A
+  Pirate older than 0.3.6rc9 refuses a run with the field.
 
 ### A Pirate job
 
-`job_start(pirate={pirate, flavour, assignment, timeout_seconds})` is refused
-before a job exists when the flavour is not registered (`not_found`), missed
-its last ping (`unavailable`) or the payload is malformed (`invalid_request`,
-also for a timeout outside 0.1 to 86400). Then the job is `running` while the
+`job_start(pirate={pirate, flavour, assignment, timeout_seconds, overrides?})`
+is refused before a job exists when the flavour is not registered
+(`not_found`), missed its last ping (`unavailable`) or the payload is malformed
+(`invalid_request`, also for a timeout outside 0.1 to 86400, or overrides that
+are not an object; overrides above 64 KiB are `limit`). `overrides` passes
+through unchanged; the Pirate's refusal of them ends the job `refused`. Then the job is `running` while the
 worker holds the connection:
 
 - a result completes it (`job_output` returns it);
@@ -180,7 +227,9 @@ worker holds the connection:
   retrying.
 
 The Pirate enforces the timeout (null: its default). The worker gives up
-`timeout_seconds + 10 s` after sending (null: 86400 + 10 s) and fails the job.
+`timeout_seconds + 15 s` after sending (null: 86400 + 15 s): the executor's
+10 s cleanup reserve for a running command plus the 5 s reply margin; then it
+fails the job.
 A Pirate restart fails its running jobs; a worker restart marks them
 `interrupted`. Nothing is retried. Pirate jobs need managed jobs (commands
 enabled) and share the 32-job pool.

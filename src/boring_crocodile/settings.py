@@ -9,10 +9,10 @@ import re
 from uuid import UUID
 
 from boring_worker_kit.inputs import table, text, integer, strings
-from boring_worker_kit.framing import MAX_OUTPUT_BYTES
 from .instructions import WELCOME
-from .site_layout import CONFIG_FILE
+from .site_layout import CONFIG_FILE, budget_slice, task_unit_prefix
 from boring_worker_kit.file_policy import FilePolicy
+from boring_worker_kit.settings import validate_execution
 
 # boring_service_kit.issuer.clients.DEFAULT_METADATA_HOSTS (a test keeps them
 # equal). Not imported: that module loads the MCP SDK, and every task runner
@@ -49,27 +49,17 @@ class EnvironmentSettings:
 
     @classmethod
     def from_mapping(cls, name: str, value: dict[str, Any]) -> "EnvironmentSettings":
-        if isinstance(value, dict) and "pirates" in value:
-            raise ValueError(
-                f"delete the [environments.{name}.pirates.*] sections from the config: "
-                "Pirates now register themselves with the Pond (no config entry is read)")
         value = table(value, f"environment {name}",
                       {"allowed_roots", "socket_path", "default_cwd", "control_plane_uid"},
                       {"display_name", "output_limit_bytes", "task_socket_path", "task_unit_prefix",
                        "task_cgroup_parent", "command_execution_enabled", "no_new_privileges",
-                       "max_parallel_tasks", "default_timeout_seconds", "max_timeout_seconds", "files",
-                       "service_registration_enabled"})
+                       "files", "service_registration_enabled"})
         allowed_roots = tuple(Path(item).resolve() for item in strings(value["allowed_roots"], "allowed_roots"))
-        obsolete = {"max_parallel_tasks", "default_timeout_seconds", "max_timeout_seconds"} & value.keys()
-        if obsolete:
-            raise ValueError("remove superseded environment limit fields: " + ", ".join(sorted(obsolete)))
-        output_limit = integer(value.get("output_limit_bytes", 65536), "output_limit_bytes", 1)
+        output_limit = integer(value.get("output_limit_bytes", 65536), "output_limit_bytes", 1)  # bounded by validate_execution
         task_socket = text(value["task_socket_path"], "task_socket_path") if "task_socket_path" in value else None
         if task_socket is not None and not Path(task_socket).is_absolute():
             raise ValueError("task_socket_path must be absolute")
-        task_prefix = text(value.get("task_unit_prefix", "boring-crocodile-task-pond"), "task_unit_prefix")
-        if not task_prefix or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in task_prefix):
-            raise ValueError("task_unit_prefix must be a plain unit-name prefix")
+        task_prefix = text(value.get("task_unit_prefix", task_unit_prefix(name)), "task_unit_prefix")
         enabled = value.get("command_execution_enabled", True)
         if type(enabled) is not bool:
             raise ValueError("command_execution_enabled must be boolean")
@@ -81,20 +71,15 @@ class EnvironmentSettings:
             raise ValueError("service_registration_enabled must be boolean")
         if services and not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ValueError("invalid service registration environment")
-        task_parent = Path(text(value.get("task_cgroup_parent", "/system.slice/system-crocodilepond.slice"), "task_cgroup_parent"))
-        if (not task_parent.is_absolute() or ".." in task_parent.parts
-                or task_parent.parent != Path("/system.slice")
-                or not task_parent.name.startswith("system-")
-                or not task_parent.name.endswith(".slice")):
-            raise ValueError("task_cgroup_parent must be a direct system.slice child slice")
-        return cls(
+        task_parent = Path(text(value.get("task_cgroup_parent", "/system.slice/" + budget_slice(name)), "task_cgroup_parent"))
+        settings = cls(
             name=name,
             display_name=text(value.get("display_name", name), "display_name"),
             socket_path=Path(text(value["socket_path"], "socket_path")),
             default_cwd=Path(text(value["default_cwd"], "default_cwd")).resolve(),
             allowed_roots=allowed_roots,
             control_plane_uid=integer(value["control_plane_uid"], "control_plane_uid", 0, 2**32 - 2),
-            output_limit_bytes=min(output_limit, MAX_OUTPUT_BYTES),
+            output_limit_bytes=output_limit,
             task_socket_path=Path(task_socket) if task_socket is not None else None,
             task_unit_prefix=task_prefix,
             task_cgroup_parent=task_parent,
@@ -103,6 +88,10 @@ class EnvironmentSettings:
             service_registration_enabled=services,
             files=FilePolicy.parse(value.get("files")),
         )
+        # worker-kit owns the execution rules (name, paths, default_cwd inside an
+        # allowed root, `<product>-task-<name>` prefix, slice, output limit).
+        validate_execution(settings)
+        return settings
 
 
 def context_files(value: Any) -> tuple[str, ...]:
@@ -181,16 +170,6 @@ def validate_ponds(ponds: dict[str, PondSettings],
         roots.append(root)
 
 
-# Keys of the old single-Pond layout. Refused by name, never ignored.
-REMOVED = {
-    "context": "delete the [context] section from the config: "
-               "each [ponds.<name>] selects its own context_root and files",
-    "execution": "delete the [execution] section (default_environment) from the config: "
-                 "each [ponds.<name>] names its own environment",
-    "approval_secret_file": "delete approval_secret_file from [auth] in the config: "
-                            "each [ponds.<name>] has its own approval_secret_file",
-}
-
 
 @dataclass(frozen=True)
 class Settings:
@@ -223,13 +202,9 @@ class Settings:
         selected = path or Path(os.environ.get("BORING_CROCODILE_CONFIG", str(CONFIG_FILE)))
         with selected.open("rb") as source:
             data = tomllib.load(source)
-        auth = data.get("auth")
-        for key in REMOVED:
-            if key in data or isinstance(auth, dict) and key in auth:
-                raise ValueError(REMOVED[key])
         table(data, "config", {"server", "auth", "environments"}, {"ponds", "pirate_services"})
         table(data["environments"], "environments")
-        auth = table(auth, "auth", {"oauth_database_file"}, {"dynamic_registration", "metadata_document_hosts"})
+        auth = table(data["auth"], "auth", {"oauth_database_file"}, {"dynamic_registration", "metadata_document_hosts"})
         dynamic = auth.get("dynamic_registration", False)
         if not isinstance(dynamic, bool):
             raise ValueError("dynamic_registration must be true or false")

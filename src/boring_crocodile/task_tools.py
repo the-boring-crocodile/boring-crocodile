@@ -1,11 +1,12 @@
 """Task-tool registration; worker lifecycle and authority stay with their owners."""
 from __future__ import annotations
-from typing import Annotated, Callable, Literal
+from typing import Annotated, Any, Awaitable, Callable, Literal
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from boring_worker_kit.batch_contracts import BatchRequest, BatchStep, validation_fields
 from boring_worker_kit.inputs import ExecTimeoutSeconds, JobTimeoutSeconds, JobWaitSeconds, ReceiptLimit
+from .batch_steps import PondBatchRequest, PondBatchStep, service_steps
 from .outcomes import refuse
 from .worker_client import WorkerClient
 
@@ -18,28 +19,43 @@ class PirateJob(BaseModel):
     # null: the Pirate's own default; the worker still waits at most
     # MAX_JOB_SECONDS (plus its margin) for the answer.
     timeout_seconds: JobTimeoutSeconds | None = None
+    # Per-call overrides for a flavour that allows them (system, tools, services,
+    # max_turns, settings); the Pirate checks them and refuses what its flavour cannot take.
+    overrides: dict[str, Any] | None = None
 
 
 def register_task_tools(mcp: MCPServer, workers: WorkerClient,
                         selected_environment: Callable[[], str],
                         command_environment: Callable[[], str],
-                        visible_batch: Callable[[dict[str, object]], dict[str, object]]) -> None:
+                        visible_batch: Callable[[dict[str, object]], dict[str, object]],
+                        service_token: Callable[[str], Awaitable[tuple[str, str]]] | None = None) -> None:
     @mcp.tool()
-    async def batch(operations: list[BatchStep], on_error: Literal["stop", "continue"] = "stop",
+    async def batch(operations: list[PondBatchStep], on_error: Literal["stop", "continue"] = "stop",
                     timeout_seconds: Annotated[float, Field(strict=True, allow_inf_nan=False,
                                                            ge=0.1, le=103)] | None = None) -> dict[str, object]:
-        """Run prepared file, exec and job steps in order; return each settled outcome.
+        """Run prepared file, exec, job and service_call steps in order; return each settled outcome.
 
         Preflight checks the entire batch before effects. Jobs retain their own
         lifecycle. Earlier effects are not rolled back when a later step fails.
+        A service_call step takes service, tool, arguments and save_to like the
+        tool; with {"$file": ...} references and save_to, files carry results
+        from one step to the next.
         """
         try:
-            admitted = BatchRequest.model_validate({"operations": operations,
+            admitted = PondBatchRequest.model_validate({"operations": operations,
                 "on_error": on_error, "timeout_seconds": timeout_seconds})
         except ValidationError as error:
             raise refuse("invalid_request", "invalid batch request",
                          fields=validation_fields(error)) from None
-        return visible_batch(await workers.batch(selected_environment(), admitted.model_dump()))
+        environment = selected_environment()
+        tokens: dict[str, str] = {}
+        for step in service_steps(admitted):  # every grant checked before any step runs
+            if service_token is None:
+                raise refuse("forbidden", "service_call steps are not available here")
+            granted_environment, tokens[step.id] = await service_token(step.arguments.service)
+            if granted_environment != environment:
+                raise refuse("forbidden", "a service_call step must use this Pond's service grant")
+        return visible_batch(await workers.batch(environment, admitted.model_dump(), tokens or None))
 
     @mcp.tool()
     async def exec(
@@ -67,9 +83,11 @@ def register_task_tools(mcp: MCPServer, workers: WorkerClient,
                         timeout_seconds: JobTimeoutSeconds | None = None) -> dict[str, object]:
         """Start a job and return its job_id at once: a command, ordered steps, or work for a Pirate.
 
-        Exactly one of command, operations (the step list `batch` takes) or
-        pirate ({pirate, flavour, assignment, timeout_seconds}; null timeout:
-        the Pirate's default). `cwd` applies only to a command.
+        Exactly one of command, operations (the `batch` steps without
+        service_call) or
+        pirate ({pirate, flavour, assignment, timeout_seconds, overrides?}; null
+        timeout: the Pirate's default; overrides only for a flavour that allows
+        them, see pirate_describe). `cwd` applies only to a command.
         timeout_seconds: default 120 for a command, 600 for operations, at
         most 86400; pond_limits shows a lower host cap for commands. Then
         job_wait, job_status, job_output (the job's `result`), job_stop. Every
@@ -82,8 +100,10 @@ def register_task_tools(mcp: MCPServer, workers: WorkerClient,
             if cwd is not None or timeout_seconds is not None:
                 raise refuse("invalid_request",
                              "a Pirate job takes its timeout inside pirate, and no cwd")
-            return await workers.job_start(command_environment(), None, None, None,
-                                           pirate=pirate.model_dump())
+            payload = pirate.model_dump()
+            if payload["overrides"] is None:
+                del payload["overrides"]  # only given overrides travel
+            return await workers.job_start(command_environment(), None, None, None, pirate=payload)
         wire_operations = None
         if operations is not None:
             if cwd is not None:

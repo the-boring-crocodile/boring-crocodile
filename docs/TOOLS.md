@@ -102,7 +102,7 @@ for anything longer than a foreground call. `job_start` takes exactly one of:
 
 - `command` (with `cwd`, `timeout_seconds` 0.1 to 86400, default 120, capped at
   the host task lifetime less 10 s);
-- `operations`, the step list `batch` takes, with `on_error` (its own budget,
+- `operations`, the `batch` steps without `service_call`, with `on_error` (its own budget,
   default 600 s, at most 86400; each `exec` step still takes a slot);
 - `pirate`, `{pirate, flavour, assignment, timeout_seconds}`
   ([SERVICES_AND_PIRATES](SERVICES_AND_PIRATES.md)).
@@ -141,18 +141,28 @@ seven days or beyond 1000 rows. A worker restart marks unfinished jobs
 `batch(operations, on_error="stop", timeout_seconds?)` runs 1 to 24 steps in
 order in one request. Steps: the seven file tools, `exec`, `job_start` (a
 command job), `job_list`, `job_status`, `job_output`, `job_stop`, `job_wait`,
-`service_list`. Not steps: `service_describe` and `service_call` (each needs
-its own minted token), nested batches, branching, or passing one step's result
-into another (read the hash first, then send the edit).
+`service_list`, `service_call` (service, tool, arguments, save_to: the control
+plane mints its token before the batch runs; not in a job's operations). Not
+steps: `service_describe`, nested batches, branching. A step's result does not
+flow into the next by itself; a file does: `save_to` writes a service answer,
+`{"$file": ...}` in a later service_call reads one (read a hash first, then
+send the edit, for file steps).
 
 The whole request is checked before anything runs. Steps share one budget of
 at most 103 s (an `exec` gets what is left; a `job_wait` step at most what is
 left). `stop` ends after a failed or refused step (`stop_reason:
 "step_refused"` for a refusal); `continue` goes on. A nonzero exit or timeout
-is a failed step; unconfirmed cleanup is `unknown` and always stops. Later
+is a failed step; unconfirmed cleanup is `unknown` and always stops. A
+`service_call` step that ran out of its own time is `unknown` (it may have
+run) and follows `on_error`; one the service failed is `failed` with its
+`failure` object; one whose answer was not saved (`save_to_refused`,
+`save_to_failed`) is `failed` with that `code`, the answer kept in `result`.
+Later
 steps are `not_started`. Request and result are capped at 768 KiB; a result
-over budget keeps every step's `id`, `method`, `status` and receipt with
-`result_truncated: true`.
+over budget keeps every step's `id`, `method`, `status` and receipt (for a
+service step: `saved_to`, `save_to_refused`, `save_to_failed`, `service_ran`)
+with `result_truncated: true`. A service answer larger than what is left is
+dropped then; save it with `save_to` instead.
 
 There is no transaction: retrying a batch can repeat an `exec` or start a
 second job. After a lost reply, check files and `job_list` first.

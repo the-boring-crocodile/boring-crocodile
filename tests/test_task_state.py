@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 
-from boring_task_state import ReceiptStore, decode_metadata, decode_result
+from boring_crocodile.task_state import ReceiptStore, decode_metadata, decode_result
 
 HEX32 = re.compile(r"[a-f0-9]{32}\Z")
 
@@ -100,7 +100,7 @@ class StoreTest(unittest.TestCase):
             self.path.unlink(missing_ok=True)
             self._legacy(table_sql, [])
             before = self.path.read_bytes()
-            with self.assertRaisesRegex(ValueError, "unsupported schema.*open it once with 0.3.1"):
+            with self.assertRaisesRegex(ValueError, "unsupported schema.*database left unchanged"):
                 ReceiptStore(self.path, "jobs")
             self.assertEqual(self.path.read_bytes(), before)
             self.assertEqual(user_version(self.path), 0)

@@ -2,8 +2,11 @@
 
 A new site in four steps: deploy the runtime, create the first Pond, activate
 the site, connect a client. Later you can add Ponds, Pirates and services to
-the running site. Every step that changes the host shows its plan first and
-applies only that plan.
+the running site. Separating the runtime from the accounts and site settings
+lets you update the code later without replacing a Pond's home or handbook.
+
+Setup commands show a plan before applying it. `deploy` has a separate
+read-only `--check`; running it without that flag performs the deployment.
 
 ## Our example
 
@@ -94,11 +97,14 @@ adopted: they make the plan ask for review.
 
 ## 3. Activate the site
 
-First decide whether the site will have Pirates. A site with Pirates accepts
-guests (`service_registration_enabled`); the site wizard does not ask, and a
-running site cannot be switched to accept guests later. Our site will have the
-Pirate `parrot`, so it activates from a file, after creating the group the
-Pirates join:
+Pirates need a local registration socket so they can announce their flavours
+to a Pond. Enable that reception only for Ponds that will use them
+(`service_registration_enabled`); it does not itself admit a Pirate. The site
+wizard leaves it off. You can enable it later with
+[`--site-render --guests POND`](OPERATIONS.md#updating).
+
+Our site will have the Pirate `parrot`, so it activates from a file, after
+creating the group the Pirates join:
 
     sudo groupadd --system pond-pirates
     sudo boring-crocodile-setup --site-config site-inputs.json
@@ -166,10 +172,13 @@ A service on the same domain adds its own routes (boring-services README).
 your proxy or a client; only the client journey proves those:
 
 1. In your MCP client, add the Pond's URL, `https://DOMAIN/mcp/POND`. In our
-   example: `https://crocodile-url.example.test/mcp/pond`. Claude and ChatGPT
-   connect with the URL alone. Other clients (VS Code, Copilot Studio) need a
-   client id first: `sudo boring-crocodile-admin oauth client-add --name ...
-   --redirect-uri ...`; open dynamic registration is off ([OAUTH](OAUTH.md)).
+   example: `https://crocodile-url.example.test/mcp/pond`. Clients presenting a
+   supported metadata document can start with that URL alone. For a registered
+   client, create its ID with `sudo boring-crocodile-admin oauth client-add
+   --name ... --redirect-uri ...` and configure it in the client; open dynamic
+   registration is off ([OAUTH](OAUTH.md)). See the family's
+   [client guide](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/clients.md)
+   for VS Code and version-specific Visual Studio notes.
 2. The sign-in page asks for the Pond's approval secret. Read it in a private
    administrator terminal: `sudo cat /etc/boring-crocodile/credentials/approval-secret`.
    Never put it in a URL, a chat, a command history or a log.
@@ -191,8 +200,21 @@ changed file; `--apply` asks for `APPLY` (unattended: `--apply
 
 ### Another Pond: `garden`
 
+Create the account and home first, then review how they will join the running
+site. This lets you inspect the new Pond's service grants and resource limits
+before it can accept a client connection:
+
     sudo boring-crocodile-setup --add-pond garden --wizard --apply
     sudo boring-crocodile-setup --site-extend --grant-services all
+
+The second command only previews the extension. If the grants and limits fit,
+apply its top-level `plan_digest`:
+
+    sudo boring-crocodile-setup --site-extend --grant-services all --apply --approve-digest DIGEST
+
+`all` grants every currently registered service. Use comma-separated service
+names instead when the new Pond needs fewer; keep the same selection in the
+preview and apply commands.
 
 Unattended, `--add-pond garden --config garden.json` takes the same answers as
 step 2's file, with the Crocodile's existing account as `control_user`:
@@ -300,9 +322,3 @@ a second Pond). It is generated (`site/default/generate.py`), and
 `tests/test_site_default.py` fails when it and the renderer drift apart. On a
 real host the UIDs, the `profile_id`, the URL and the memory ceiling (a
 quarter of RAM, 512 MiB to 8 GiB) differ.
-
-The renderer behind activation can also run alone. It writes a new directory
-and installs nothing:
-
-    sudo boring-crocodile-render-services --receipt /etc/boring-crocodile/initial-setup.json \
-        --service-inputs site-inputs.json --output NEW_DIRECTORY

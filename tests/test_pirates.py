@@ -287,6 +287,32 @@ class PirateJobTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.list_jobs("pond"))["jobs"], [])
         self.assertEqual(self.pirate.requests, [])
 
+    async def test_overrides_pass_through_unchanged_and_only_when_given(self):
+        overrides = {"system": "You are a careful reviewer.", "tools": ["file_read"], "max_turns": 30,
+                     "settings": {"max_tokens": 500}}
+        started = await self.client.job_start("pond", None, None, None, pirate={
+            "pirate": ME, "flavour": "default", "assignment": "work", "timeout_seconds": 30,
+            "overrides": overrides})
+        await self.client.job_wait("pond", [started["job_id"]], 5)
+        self.assertEqual(self.pirate.requests[-1]["overrides"], overrides)
+        for given in ({}, {"overrides": None}):  # absent on the wire: an older Pirate still runs it
+            with self.subTest(given=given):
+                await self.run_job() if not given else await self.client.job_wait("pond", [(
+                    await self.client.job_start("pond", None, None, None, pirate={
+                        "pirate": ME, "flavour": "default", "assignment": "work", "timeout_seconds": 30,
+                        **given}))["job_id"]], 5)
+                self.assertNotIn("overrides", self.pirate.requests[-1])
+        payload = {"pirate": ME, "flavour": "default", "assignment": "x", "timeout_seconds": None}
+        for bad, code in (({**payload, "overrides": ["system"]}, "invalid_request"),
+                          ({**payload, "overrides": {"system": "x" * (64 * 1024)}}, "limit"),
+                          ({**payload, "extra": 1}, "invalid_request")):
+            with self.subTest(code=code), self.assertRaises(RefusalError) as caught:
+                await self.client.job_start("pond", None, None, None, pirate=bad)
+            self.assertEqual(caught.exception.code, code)
+        PirateJob(**payload, overrides={"system": "x"})
+        with self.assertRaises(ValidationError):
+            PirateJob(**payload, overrides=["system"])
+
     async def test_null_timeout_is_the_pirates_default_but_the_wait_is_bounded(self):
         # Toward the Pirate, null stays null (its own default) ...
         job_id, output = await self.run_job(timeout_seconds=None)
@@ -303,6 +329,7 @@ class PirateJobTest(unittest.IsolatedAsyncioTestCase):
                 await self.worker.pirates.run({**target, "timeout_seconds": timeout}, job_id)
                 self.assertEqual(exchange.await_args.args[3], deadline)
         self.assertEqual(MAX_JOB_SECONDS, 86400)
+        self.assertEqual(pirates.RUN_MARGIN_SECONDS, 15)  # cleanup reserve 10 + reply margin 5
 
     def test_the_tool_schema_bounds_the_timeout_like_every_job(self):
         payload = {"pirate": ME, "flavour": "default", "assignment": "x"}
@@ -321,3 +348,8 @@ class PirateJobTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RefusalError) as caught:
             await self.client.pirate_describe("pond", ME, "nope")
         self.assertEqual(caught.exception.code, "not_found")
+        # The carried budget bounds the whole exchange; none left is refused before connecting.
+        with self.assertRaises(Refusal) as refused:
+            await self.worker.pirates.describe(ME, "default", 0)
+        self.assertEqual(refused.exception.code, "limit")
+        self.assertEqual(len(self.pirate.requests), 1)  # nothing more was sent

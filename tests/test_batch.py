@@ -363,8 +363,8 @@ class BatchSocketTest(unittest.IsolatedAsyncioTestCase):
 
 
 class BatchServiceTest(unittest.IsolatedAsyncioTestCase):
-    """Only the registry view is a batch step: a service call needs a token
-    the control plane mints for that one call."""
+    """The registry view is a step; a service_call step needs the token the
+    control plane mints for it (tests/test_file_refs.py runs them)."""
 
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -395,10 +395,24 @@ class BatchServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["results"][0]["result"], {"services": [{
             "name": "example", "available": True, "misses": 0, "last_miss": None}]})
 
-    async def test_service_describe_and_call_are_not_steps(self):
-        for method, arguments in (("service_describe", {"service": "example"}),
-                                  ("service_call", {"service": "example", "tool": "echo",
-                                                    "arguments": {}})):
-            with self.subTest(method=method), self.assertRaises(RefusalError) as caught:
-                await self.batch(step("one", method, **arguments))
-            self.assertEqual(caught.exception.code, "invalid_request")
+    async def test_service_describe_is_no_step_and_service_call_needs_its_token(self):
+        with self.assertRaises(RefusalError) as caught:
+            await self.batch(step("one", "service_describe", service="example"))
+        self.assertEqual(caught.exception.code, "invalid_request")
+        # A service_call step without the token the control plane mints for it (a
+        # job's operations, or a request that bypassed the control plane): refused.
+        with self.assertRaises(RefusalError) as caught:
+            await self.batch(step("one", "service_call", service="example", tool="echo", arguments={}))
+        self.assertEqual(caught.exception.code, "forbidden")
+
+
+class TrimKeepsSaveOutcomeTest(unittest.TestCase):
+    def test_a_dropped_service_answer_keeps_its_save_outcome(self):
+        from boring_crocodile.batch import _trim_result
+        answer = {"content": [{"type": "text", "text": "x" * 5000}], "service_ran": True,
+                  "save_to_failed": {"message": "slow", "effects": "unknown"}}
+        trimmed, cut = _trim_result(answer, 512)
+        self.assertTrue(cut)
+        self.assertEqual(trimmed["save_to_failed"], answer["save_to_failed"])
+        self.assertTrue(trimmed["service_ran"])
+        self.assertTrue(trimmed["result_omitted"])
