@@ -23,7 +23,7 @@ Pond: no tool takes an `environment` argument.
 
 ## Choose the right owner
 
-- `batch` orders up to 24 file, exec, job and `service_list` steps under one
+- `batch` orders up to 24 file, exec, job, `service_list` and `service_call` steps under one
   foreground deadline. It validates all step shapes and configured authority
   before effects. Steps run in order; `on_error=stop` or `continue` controls
   ordinary settled failures. A job receipt outlives the batch. A stopped batch
@@ -41,8 +41,8 @@ Pond: no tool takes an `environment` argument.
   a failure instead. Truncated streams retain their head and tail around an
   omission marker; stdout_bytes/stderr_bytes count all drained bytes.
 - `job_start` starts a managed job and returns its server-minted `job_id`:
-  exactly one of a `command`, the same `operations` step list `batch` takes,
-  or a `pirate` job (below).
+  exactly one of a `command`, an `operations` step list (the `batch` steps
+  without `service_call`), or a `pirate` job (below).
   `timeout_seconds` defaults to 120 s for a command and 600 s for operations
   and is at most 86400 s (one day); `pond_limits` reports a lower host cap for
   command jobs. There is no unlimited job.
@@ -83,8 +83,11 @@ Pond: no tool takes an `environment` argument.
   `available` (it answered the last heartbeat ping, every 3 s), `misses` and
   `last_miss`. `pirate_describe(pirate, flavour)` asks that flavour for its own
   description. Give it work as a job:
-  `job_start(pirate={"pirate", "flavour", "assignment", "timeout_seconds"})`;
-  the Pirate enforces the timeout, 0.1 to 86400 s like every job (null: its
+  `job_start(pirate={"pirate", "flavour", "assignment", "timeout_seconds"})`,
+  optionally with `"overrides"` (`system`, `tools`, `services`, `max_turns`,
+  `settings`) for a flavour whose description shows `allow_overrides`: they
+  only narrow it, within its `caps`; any other flavour refuses them. The Pirate
+  enforces the timeout, 0.1 to 86400 s like every job (null: its
   default, waited for at most 86400 s). The job holds one
   connection to the Pirate until it answers: its answer is the job's `result`;
   its refusal (for example `busy`, one job per flavour at a time) ends the job
@@ -116,7 +119,8 @@ available and the text otherwise. Our codes:
 - `stale`: the file changed since you read it; `current_sha256` is its hash
   now (`null` when it is absent). Re-read before editing again.
 - `busy`: a shared resource is held right now; try again shortly.
-- `limit`: a size, count or capacity limit was reached.
+- `limit`: a size, count or capacity limit was reached, or no time was left
+  for the work (nothing was sent).
 - `not_admitted`: the work was not started; retrying is safe.
 - `unavailable`: the Pirate or service is not listening or missed its last ping.
 
@@ -176,9 +180,43 @@ lists a service's tools with their input schemas. `service_call(service, tool,
 arguments)` calls one tool; the service validates the arguments. A service's
 refusal arrives with its own code (`tool_error` when it gave none,
 `service_error` with `service_code` for a protocol error); a service that
-rejects the call token (HTTP 401/403) is `forbidden`. Calls have a
-30-second deadline (an earlier caller cancellation still applies). A timeout or dropped connection is a failure that may
-have run: check before repeating a write. A service that is not registered
-here is `not_found`; one that missed its last ping is `unavailable` until it
-answers again. Only `service_list` is a batch step. These tools are separate
-from Pirates.
+rejects the call token (HTTP 401/403) is `forbidden`. A service gets at most
+30 s to answer, less when the request has less time left (inside a batch: what
+remains of it, minus 5 s). With no time left the call is refused `limit` and
+nothing is sent. A timeout or dropped connection is a failure that may have
+run: check before repeating a write. A service that is not registered here is
+`not_found`; one that missed its last ping is `unavailable` until it answers
+again. `service_list` and `service_call` are batch steps (a service step's
+token is minted before the batch runs; not in a job's operations), so a batch
+can render a file with `exec`, push it with `$file`, save the answer with
+`save_to` and check that file, in one request. These tools are separate from
+Pirates.
+
+Content you only move between a file and a service need not pass through you.
+Any argument value may be `{"$file": {"root": ..., "path": ..., "sha256": ...}}`
+(sha256 optional). The worker replaces it with that file's exact text (UTF-8,
+line ends kept, a leading BOM dropped), under the same root rules as
+`file_read`. At most 16 references and 512 KiB in all per call (`limit`). An
+object whose only key is `$file` is always a reference; a malformed one is
+refused. `arguments` itself must be an object, not a reference.
+
+`save_to: {"root", "path", "expected_sha256"}` (null for a new file) writes
+the service's answer to that file: its text when it is one text item,
+otherwise the answer as JSON. You get `saved_to` (root, path, hash, bytes)
+instead of the answer. A target that does not match, a root you may not write
+or a missing directory is refused before the call. The service's time then
+ends 5 s before the request's, to leave time for the write. If the save does
+not succeed after the service ran, the answer comes back with one of:
+
+- `save_to_refused`: the write was refused (with its code); nothing was written.
+- `save_to_failed` (`effects: unknown`): the write failed or did not finish in
+  time; the file may still be written. Compare its hash before writing again.
+
+In a batch such a step is `failed` with `code` (`save_to_refused` or
+`save_to_failed`), the answer still in its `result`; `stop` ends the batch
+there, so a later step never relies on a file that was not saved.
+
+An answer over 1 MiB then comes back only as its size, with `service_ran`;
+inside a batch, an answer larger than the batch result has room for is
+dropped, keeping `service_ran` and the save outcome.
+Read the saved file only if you need the content.

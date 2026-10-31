@@ -61,13 +61,12 @@ misconfiguration to fix, never a feature to build on.
 Dependencies: pyproject.toml declares ranges; `requirements.lock` pins every
 runtime dependency with hashes for Python 3.10-3.14 (regenerate with
 `scripts/lock.py`). Pond Common (registry, file-core, service-kit,
-worker-kit) comes from its released wheels; boring-task-state is built from
-`packages/` here. Set up a development venv:
+worker-kit, deploy) comes from its released wheels. Set up a development venv:
 
 ```text
 python -m venv .venv && . .venv/bin/activate
 pip install --require-hashes --find-links <Common dist> -r requirements.lock
-pip install --no-deps -e packages/boring-task-state -e .
+pip install --no-deps -e .
 pip install -r requirements-dev.txt
 ```
 
@@ -93,9 +92,8 @@ strictly at runtime: unknown keys and arguments are refused, booleans and
 numeric strings are not numbers.
 
 Shared libraries (boring-registry, boring-file-core, boring-service-kit,
-boring-worker-kit) come from [Pond Common](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/README.md)
-releases; boring-task-state is owned here (`packages/`), the Crocodile is its
-only consumer.
+boring-worker-kit, boring-deploy) come from [Pond Common](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/README.md)
+releases.
 
 ## Licence
 

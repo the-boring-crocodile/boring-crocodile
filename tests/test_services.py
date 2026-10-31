@@ -316,15 +316,32 @@ class WorkerServiceTest(unittest.IsolatedAsyncioTestCase):
                 await self.client.service_call("test", "canvas", "slow", {}, "good")
 
 
-class ServiceDeadlineTest(unittest.TestCase):
-    def test_the_control_plane_outwaits_the_workers_service_deadline(self):
-        # The worker's own timeout (which says the call may have run) must
-        # reach the caller; the control plane's wrapper is derived from it.
+class ServiceDeadlineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_requests_carry_their_budget_and_the_caller_waits_one_margin_more(self):
+        # The worker's own deadline (which says the call may have run) must reach
+        # the caller: the control plane waits the budget plus REPLY_MARGIN_SECONDS.
         from boring_crocodile import worker_client
+        from boring_worker_kit.deadlines import REPLY_MARGIN_SECONDS, SERVICE_OPERATION_SECONDS
         from boring_worker_kit.services import CALL_TIMEOUT_SECONDS
-        self.assertEqual(worker_client.SERVICE_REQUEST_TIMEOUT,
-                         CALL_TIMEOUT_SECONDS + worker_client.SERVICE_WORKER_MARGIN_SECONDS)
-        self.assertGreater(worker_client.SERVICE_WORKER_MARGIN_SECONDS, 0)
+        seen = []
+        client = worker_client.WorkerClient({})
+
+        async def fake(environment, operation, **arguments):
+            seen.append((operation, arguments.get("budget_seconds")))
+            return {}
+        waits = []
+        real_wait_for = asyncio.wait_for
+
+        async def recording(awaitable, timeout):
+            waits.append(timeout)
+            return await real_wait_for(awaitable, timeout)
+        with patch.object(client, "_request", fake), patch.object(worker_client.asyncio, "wait_for", recording):
+            await client.service_call("e", "canvas", "x", {}, "t")
+            await client.service_describe("e", "canvas", "t")
+            await client.request("e", "exec", command="true")
+        self.assertEqual([b for _, b in seen], [SERVICE_OPERATION_SECONDS, CALL_TIMEOUT_SECONDS, 103])
+        self.assertEqual(waits, [SERVICE_OPERATION_SECONDS + REPLY_MARGIN_SECONDS,
+                                 CALL_TIMEOUT_SECONDS + REPLY_MARGIN_SECONDS, 103 + REPLY_MARGIN_SECONDS])
 
 
 class FailedServiceOutcomeTest(unittest.TestCase):

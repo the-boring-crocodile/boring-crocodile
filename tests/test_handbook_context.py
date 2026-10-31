@@ -160,7 +160,7 @@ class SharedGuidePackageTest(unittest.TestCase):
     def test_packaged_guide_is_its_own_hashed_document(self):
         from boring_crocodile.shared_guide import load_shared_guide
         guide = load_shared_guide()
-        self.assertEqual(guide["version"], "20")
+        self.assertEqual(guide["version"], "23")
         self.assertIn("Where were we?", guide["content"])
         self.assertEqual(guide["sha256"],
                          hashlib.sha256(guide["content"].encode("utf-8")).hexdigest())

@@ -47,6 +47,11 @@ def budget_slice(pond: str) -> str:
     return "system-crocodile" + pond.replace("-", "_") + ".slice"
 
 
+def task_unit_prefix(pond: str) -> str:
+    """The Pond's task unit prefix: worker-kit's `<product>-task-<execution name>`."""
+    return "boring-crocodile-task-" + pond
+
+
 def tmpfiles_name(pond: str) -> str:
     """tmpfiles.d file name of a Pond's runtime directories."""
     return "boring-crocodile.conf" if pond == INITIAL_POND else f"boring-crocodile-{pond}.conf"

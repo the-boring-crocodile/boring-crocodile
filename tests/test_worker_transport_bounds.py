@@ -22,7 +22,7 @@ class TransportBounds(unittest.IsolatedAsyncioTestCase):
         with patch("asyncio.open_unix_connection", AsyncMock(return_value=(object(), writer))), \
              patch("boring_crocodile.worker_client.write_frame", AsyncMock()), \
              patch("boring_crocodile.worker_client.read_frame", silent), \
-             patch("boring_crocodile.worker_client.WORKER_REQUEST_TIMEOUT", .03, create=True):
+             patch("boring_crocodile.worker_client.REPLY_MARGIN_SECONDS", 0):
             with pytest.raises(FailureReport, match="may have run"):
-                await asyncio.wait_for(client.request("test", "limits"), .3)
+                await asyncio.wait_for(client.request("test", "limits", budget=.03), .3)
         writer.wait_closed.assert_awaited()

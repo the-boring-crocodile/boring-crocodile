@@ -21,40 +21,48 @@ class SettingsTest(unittest.TestCase):
             self.assertEqual(settings.environments["pond"].default_cwd, Path(directory))
             self.assertEqual(settings.ponds["pond"].context_root, Path(directory))
 
-    def test_refuses_the_single_pond_layout_by_key(self) -> None:
-        # Each stale key names itself; a config without Ponds says so.
+    def test_retired_keys_fall_to_the_unknown_key_rule(self) -> None:
+        # Keys of earlier layouts have no named refusal any more: the generic
+        # unknown-key rule refuses them, and a config without Ponds says so.
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(directory)
             base = config.read_text()
-            for stale, message in (
-                    ('[execution]\ndefault_environment = "pond"\n', r"delete the \[execution\] section \(default_environment\)"),
-                    ('[context]\nroot = "/srv"\n', r"delete the \[context\] section"),
-                    ('[auth]\n', r"delete approval_secret_file from \[auth\]")):
-                text = (base.replace("[auth]\n", '[auth]\napproval_secret_file = "/srv/secret"\n')
-                        if stale == "[auth]\n" else stale + base)
-                config.write_text(text)
-                with self.subTest(stale=stale), self.assertRaisesRegex(ValueError, message):
+            for stale in ('[execution]\ndefault_environment = "pond"\n' + base,
+                          '[context]\nroot = "/srv"\n' + base,
+                          base.replace("[auth]\n", '[auth]\napproval_secret_file = "/srv/secret"\n'),
+                          base.replace("[environments.pond]\n", "[environments.pond]\nmax_parallel_tasks = 2\n"),
+                          base + '[environments.pond.pirates.parrot]\nsocket_path = "/srv/parrot.sock"\n'):
+                config.write_text(stale)
+                with self.subTest(stale=stale), self.assertRaises(ValueError):
                     Settings.load(config)
             config.write_text(base[:base.index("[ponds.pond]")] + base[base.index("[environments.pond]"):])
             with self.assertRaisesRegex(ValueError, r"at least one \[ponds.<name>\]"):
                 Settings.load(config)
 
-    def test_refuses_a_pirates_section_and_loads_the_command_gate(self):
+    def test_worker_kit_owns_the_execution_rules(self):
+        # Defaults follow the environment's name; what breaks worker-kit's rules is refused.
         with tempfile.TemporaryDirectory() as directory:
-            config = self.config(directory, """command_execution_enabled = false
-[environments.pond.pirates.parrot]
-display_name = "Parrot"
-socket_path = "/srv/parrot.sock"
-""")
-            # Pirates register themselves now; a leftover section is refused
-            # at startup and tells the admin what to delete.
-            with self.assertRaisesRegex(ValueError,
-                                        r"delete the \[environments\.pond\.pirates\.\*\] sections"):
-                Settings.load(config)
-            config.write_text(config.read_text().split("[environments.pond.pirates.parrot]")[0])
-            environment = Settings.load(config).environments["pond"]
+            config = self.config(directory)
+            garden = config.read_text().replace('environment = "pond"', 'environment = "garden"') \
+                .replace("[environments.pond]", "[environments.garden]")
+            config.write_text(garden)
+            environment = Settings.load(config).environments["garden"]
+            self.assertEqual(environment.task_unit_prefix, "boring-crocodile-task-garden")
+            self.assertEqual(environment.task_cgroup_parent, Path("/system.slice/system-crocodilegarden.slice"))
+            outside = str(Path(directory).parent)
+            for line, message in (('task_unit_prefix = "boring-crocodile-task-pond"', "task prefix must match"),
+                                  ('task_cgroup_parent = "/system.slice/nested/x.slice"', "direct system.slice child"),
+                                  ("output_limit_bytes = 1000000000", "output_limit_bytes must be"),
+                                  (f'default_cwd = "{outside}"', "default_cwd must be inside")):
+                text = garden.replace(f'default_cwd = "{directory}"\n', "") if line.startswith("default_cwd") else garden
+                config.write_text(text + line + "\n")
+                with self.subTest(line=line), self.assertRaisesRegex(ValueError, message):
+                    Settings.load(config)
+
+    def test_loads_the_command_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Settings.load(self.config(directory, "command_execution_enabled = false\n")).environments["pond"]
             self.assertFalse(environment.command_execution_enabled)
-            self.assertFalse(hasattr(environment, "pirates"))
 
     def test_files_toml_admission_with_commands_disabled(self):
         with tempfile.TemporaryDirectory() as directory:

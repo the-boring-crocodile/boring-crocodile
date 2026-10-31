@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate the fresh-install reference in site/default from the renderer.
 
-    PYTHONPATH=src:packages/boring-task-state/src \
+    PYTHONPATH=src \
         <development venv with Pond Common>/bin/python site/default/generate.py
 
 Every file below etc/ (one Pond) and two-ponds/etc/ (a second Pond added

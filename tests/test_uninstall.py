@@ -404,8 +404,8 @@ class UninstallPlanTest(unittest.TestCase):
         kinds = [a["kind"] for a in proposal["actions"]]
         self.assertNotIn("secure_home", kinds)
         self.assertIn("delete_user", kinds)
-        with self.assertRaisesRegex(UninstallConflict, "ownership changed"):
-            uninstall._check_home(home, 0)  # apply never accepts root's home as the worker's
+        with self.assertRaisesRegex(UninstallConflict, "belongs to uid"):
+            uninstall._check_home(home, 0)  # apply never takes the worker's home for root's
 
     def test_apply_refuses_a_stale_digest(self):
         with patch.object(uninstall, "plan", partial(plan, reality=FakeReality())):
@@ -508,7 +508,7 @@ class RemovalBoundaryTest(unittest.TestCase):
 
 
 class SecureHomeTest(unittest.TestCase):
-    """On disk; the test gives the home to its own user, root would give it to root."""
+    """On disk; the mode really changes, the owner change is recorded (the test cannot chown to root)."""
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -516,30 +516,46 @@ class SecureHomeTest(unittest.TestCase):
         (self.home / "work").mkdir(parents=True)
         (self.home / "work/notes.md").write_text("kept\n")
         self.home.chmod(0o755)
-        self.me = (os.getuid(), os.getgid())
 
     def tearDown(self):
         self.temporary.cleanup()
 
+    def seal_to_me(self):
+        # The test cannot give a folder to root: fchown records what it was asked.
+        self.owned = {}
+
+        def fchown(fd, uid, gid):
+            self.owned[os.readlink(f"/proc/self/fd/{fd}")] = (uid, gid)
+        return patch("boring_deploy.install.os.fchown", fchown)
+
     def test_the_top_folder_changes_owner_and_mode_only(self):
         inside = (self.home / "work").stat().st_mode
-        _secure_home(self.home, os.getuid(), owner=self.me)
-        info = self.home.lstat()
-        self.assertEqual((info.st_mode & 0o7777, info.st_uid, info.st_gid), (0o700, *self.me))
+        with self.seal_to_me():
+            _secure_home(self.home, os.getuid())
+        self.assertEqual(self.home.lstat().st_mode & 0o7777, 0o700)
+        self.assertEqual(self.owned, {str(self.home): (0, 0)})
         self.assertEqual((self.home / "work/notes.md").read_text(), "kept\n")
         self.assertEqual((self.home / "work").stat().st_mode, inside)
 
     def test_a_symlink_a_mount_or_another_owner_is_refused_untouched(self):
         link = self.home.with_name("link")
         link.symlink_to(self.home)
-        with self.assertRaisesRegex(UninstallConflict, "symlinked home"):
-            _secure_home(link, os.getuid(), owner=self.me)
-        with patch("boring_crocodile.uninstall._mount_points", return_value=[str(self.home)]):
-            with self.assertRaisesRegex(UninstallConflict, "mounted home"):
-                _secure_home(self.home, os.getuid(), owner=self.me)
-        with self.assertRaisesRegex(UninstallConflict, "ownership changed"):
-            _secure_home(self.home, os.getuid() + 1, owner=self.me)
+        with self.seal_to_me():
+            with self.assertRaisesRegex(UninstallConflict, "is a symlink"):
+                _secure_home(link, os.getuid())
+            with patch("boring_deploy.install._mount_points", return_value={str(self.home)}):
+                with self.assertRaisesRegex(UninstallConflict, "is a mount point"):
+                    _secure_home(self.home, os.getuid())
+            with self.assertRaisesRegex(UninstallConflict, "belongs to uid"):
+                _secure_home(self.home, os.getuid() + 1)
         self.assertEqual(self.home.lstat().st_mode & 0o777, 0o755)
+
+    def test_a_home_gone_since_the_plan_is_refused_not_skipped(self):
+        gone = self.home.with_name("gone")
+        with self.seal_to_me():
+            with self.assertRaisesRegex(UninstallConflict, "changed since the plan"):
+                _secure_home(gone, os.getuid())
+        self.assertEqual(self.owned, {})
 
 
 class UserDeletionTest(unittest.TestCase):

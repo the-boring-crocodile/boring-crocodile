@@ -33,8 +33,7 @@ def validate_home(home, execution_user):
             or len(Path(home).parts) < 3 or len(Path(home).parts) > 8
             or any(not HOME_PART.fullmatch(part) for part in Path(home).parts[1:])
             or Path(home).parts[1] in RESERVED_HOME_PARENTS
-            or Path(home).name != execution_user
-            or Path("/srv/boring-crocodile") in Path(home).parents):
+            or Path(home).name != execution_user):
         raise ValueError(f"The home must be an absolute path ending in /{execution_user}, two to seven "
                          "folders deep, under a parent like /home or /srv (not /etc, /root, /tmp, /usr, "
                          "/var or another system folder)")
@@ -385,6 +384,10 @@ def main(argv=None):
     mode.add_argument("--config", type=Path, help="Unattended JSON input; no prompts")
     mode.add_argument("--site-extend", action="store_true",
                       help="Bring Ponds created with --add-pond into the running site (site-check first)")
+    mode.add_argument("--site-render", action="store_true",
+                      help="Write the site's units and tmpfiles as this release renders them; with --guests, "
+                           "let running Ponds accept guests (site-check first)")
+    parser.add_argument("--guests", metavar="PONDS", help="with --site-render: Ponds that start accepting guests")
     parser.add_argument("--add-pond", metavar="NAME", help="Create a new Pond's accounts and home for the site's controller; then --site-extend")
     parser.add_argument("--save-inputs", type=Path, help="Create a reusable input file without overwriting")
     parser.add_argument("--apply", action="store_true", help="Root-only initial account/context provisioning")
@@ -409,6 +412,16 @@ def main(argv=None):
                    ("--swap", args.swap), ("--tasks", args.tasks), ("--bring-back", args.bring_back)]
     if not args.site_extend and any(value for _, value in extend_only):
         parser.error("--grant-services, --memory, --swap, --tasks and --bring-back belong to --site-extend")
+    if args.guests and not args.site_render:
+        parser.error("--guests belongs to --site-render")
+    if args.site_render:
+        if args.add_pond or args.save_inputs or args.resume or any(value for _, value in extend_only):
+            parser.error("--site-render takes only --guests, --apply and --approve-digest")
+        from .site_render import main as render_site_files
+        forwarded = (["--guests", args.guests] if args.guests else []) + (["--apply"] if args.apply else [])
+        if args.approve_digest:
+            forwarded += ["--approve-digest", args.approve_digest]
+        return render_site_files(forwarded)
     if args.site_extend:
         if args.add_pond or args.save_inputs or args.resume:
             parser.error("--site-extend does not accept account setup options")

@@ -40,7 +40,7 @@ from .settings import Settings
 from .setup import SetupInputs
 from .setup_services import ServiceInputs, render_site
 from .site_layout import (CONFIG_FILE, CREDENTIALS_DIR, INITIAL_POND, approval_credential,
-                          budget_slice, tmpfiles_name)
+                          budget_slice, task_unit_prefix, tmpfiles_name)
 from .task_policy_admin import POLICY_DROPIN, policy_dropin, trusted_path
 
 UNITS = Path("/etc/systemd/system")
@@ -225,7 +225,7 @@ class Check:
             expected = {
                 "socket_path": Path(f"/run/boring-crocodile/workers/{name}/control.sock"),
                 "task_socket_path": Path(f"/run/boring-crocodile/tasks/{name}.sock"),
-                "task_unit_prefix": f"boring-crocodile-task-{name}",
+                "task_unit_prefix": task_unit_prefix(name),
                 "task_cgroup_parent": Path("/system.slice") / budget_slice(name),
             }
             for key, value in expected.items():

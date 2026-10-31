@@ -22,7 +22,7 @@ import os
 import re
 from typing import TYPE_CHECKING
 
-from boring_task_state import TERMINAL_STATES, UNFINISHED_STATES, ReceiptStore, decode_result
+from .task_state import TERMINAL_STATES, UNFINISHED_STATES, ReceiptStore, decode_result
 
 from boring_worker_kit.execution import EnvironmentExecutor, prepare_command
 from boring_worker_kit.inputs import MAX_JOB_SECONDS

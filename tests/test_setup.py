@@ -64,7 +64,7 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(base, "/srv/workspaces/example-worker")
         inputs = SetupInputs.parse(example() | {"home": base})
         self.assertEqual(inputs.home, base)
-        for path in ("/etc/example-worker", "/srv/boring-crocodile/example-worker",
+        for path in ("/etc/example-worker",
                      "/mnt/../example-worker", "/tmp/example-worker",
                      "/srv/another-user", "/srv/space here/example-worker"):
             with self.subTest(path=path), self.assertRaises(ValueError):

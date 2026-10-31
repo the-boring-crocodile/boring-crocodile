@@ -43,6 +43,9 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
+from boring_deploy import Failure
+from boring_deploy.install import seal_check, seal_folders
+
 from . import oauth_records
 from .pirates import REGISTRATION_ROOT
 from .settings import Settings
@@ -467,32 +470,28 @@ def _delete_path(path):
 
 
 def _check_home(path, expected_uid):
-    """A home to give to root: a real folder (no symlink, no mount point) of the
-    account about to go. A home root has already is no step (_handed_to_root)."""
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode):
-        raise UninstallConflict("Refusing a symlinked home: " + str(path))
-    if not stat.S_ISDIR(info.st_mode):
-        raise UninstallConflict("Home is not a folder: " + str(path))
-    if str(path) in _mount_points():
-        raise UninstallConflict("Refusing a mounted home: " + str(path))
-    if info.st_uid != expected_uid:
-        raise UninstallConflict("Home ownership changed since the plan: " + str(path))
-
-
-def _secure_home(path, expected_uid, owner=(0, 0)):
-    """Give the home's top folder to root, mode 0700, before userdel frees the
-    uid: what is inside keeps its owner but is out of reach. The folder is
-    opened without following a symlink and changed through that descriptor."""
-    _check_home(path, expected_uid)
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    """A home to give to root: boring-deploy's seal checks (a real folder, no
+    symlink, no mount point, still the account's), without a change. The plan
+    made this step for a home the account owned, so a home that is gone or
+    root's by now changed under us: refused, not skipped (seal_check would
+    skip both). A home root had at planning time is no step (_handed_to_root)."""
     try:
-        if os.fstat(fd).st_ino != path.lstat().st_ino:
-            raise UninstallConflict("Home changed while it was checked: " + str(path))
-        os.fchmod(fd, 0o700)  # mode first: a stop between leaves it the worker's, and a re-run redoes it
-        os.fchown(fd, *owner)
-    finally:
-        os.close(fd)
+        if not seal_check([path], expected_uid):
+            raise UninstallConflict("A home changed since the plan (gone, or root's now); "
+                                    "inspect it, then plan again: " + str(path))
+    except Failure as error:
+        raise UninstallConflict(str(error)) from None
+
+
+def _secure_home(path, expected_uid):
+    """Give the home's top folder to root, mode 0700, before userdel frees the
+    uid: boring-deploy's seal_folders, the one implementation of this step,
+    after the same checks as the preflight."""
+    _check_home(path, expected_uid)
+    try:
+        seal_folders([path], expected_uid, lambda line: print(line, file=sys.stderr))
+    except Failure as error:
+        raise UninstallConflict(str(error)) from None
 
 
 def _oauth_keys(path, profile_id, owner, *, caller=None):

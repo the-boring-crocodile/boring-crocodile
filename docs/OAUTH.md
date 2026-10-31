@@ -13,9 +13,14 @@ Following the MCP specification of 2026-07-28:
 
 | Client | How it gets a client id | Configuration |
 |---|---|---|
-| Claude, ChatGPT | its Client ID Metadata Document on `claude.ai` / `chatgpt.com`, fetched (no redirects, 16 KiB, 5 s) and cached a day | `[auth] metadata_document_hosts`, default both |
-| VS Code, Copilot Studio, scripts | pre-registered: `admin oauth client-add --name ... --redirect-uri ...` | none |
-| anything else | open dynamic registration (RFC 7591) | `[auth] dynamic_registration = true`, off by default; Visual Studio needs it |
+| Client presenting a metadata-document URL | HTTPS document on an allowed host, fetched (no redirects, 16 KiB, 5 s) and cached a day | `[auth] metadata_document_hosts`, default `claude.ai` and `chatgpt.com` |
+| Client configured with an administrator-issued ID | pre-registered: `admin oauth client-add --name ... --redirect-uri ...` | use the returned ID in that client's configuration |
+| Client using dynamic registration (RFC 7591) | registers with the issuer | `[auth] dynamic_registration = true`, off by default |
+
+Client support depends on the product and version. The family's
+[client guide](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/clients.md)
+gives the explicit VS Code client-ID setup and separates our Visual Studio17.14
+observations from current-client acceptance.
 
 A client has an origin (`admin`, `metadata`, `dynamic`) and a state:
 `registered` until its first completed sign-in (gone after a day; at most 1000
@@ -34,7 +39,7 @@ that sign-in (counted in the controller's memory).
 | pending approval, authorization code | 300 s |
 | access token | 3600 s |
 | refresh token | 14 days |
-| service-call token (minted for one Pond and service) | 300 s |
+| service-call token (minted for one Pond and service) | 3600 s, renewed below 900 s left |
 
 Each token is bound to the resource it was issued for: one `/mcp/POND`, or a
 service's URL. An authorization request for any other resource, or for none,

@@ -109,3 +109,22 @@ def test_smoke_tolerates_an_old_failure_but_never_a_dead_controller(steps, monke
         _smoke(module, monkeypatch, {"site.controller": True, "pond.worker_active": True},
                {"site.controller": True, "pond.worker_active": False})
 
+
+
+def test_check_says_when_the_new_release_renders_site_files_differently(steps):
+    """The deploy changes no site file; it says which ones --site-render would write."""
+    import json
+    module, ctx, state = steps
+    report = {"irregular": [{"what": "differs from the Crocodile's template",
+                             "path": "/etc/systemd/system/boring-crocodile-worker-pond.service"},
+                            {"what": "drop-in sets a directive the Crocodile does not know", "path": "/x.conf"}]}
+    logged = []
+    ctx.new, ctx.log = Path("/new"), logged.append
+    ctx.run = lambda *command, **kw: types.SimpleNamespace(stdout=json.dumps(report))
+    module._render_due(ctx)
+    assert logged == ["1 site files differ from what the new release renders (boring-crocodile-worker-pond.service); "
+                      "the deploy changes none: afterwards, boring-crocodile-setup --site-render shows the plan"]
+    logged.clear()
+    ctx.run = lambda *command, **kw: types.SimpleNamespace(stdout=json.dumps({"irregular": []}))
+    module._render_due(ctx)
+    assert logged == []

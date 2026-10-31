@@ -3,21 +3,18 @@ from __future__ import annotations
 import asyncio
 import secrets
 
+from boring_worker_kit.deadlines import REPLY_MARGIN_SECONDS, SERVICE_OPERATION_SECONDS
 from boring_worker_kit.framing import read_frame, write_frame
+from boring_worker_kit.host_limits import FOREGROUND_REQUEST_SECONDS
 from .outcomes import FailureReport, RefusalError, is_code
 from boring_worker_kit.services import CALL_TIMEOUT_SECONDS
+from .pirates import REQUEST_TIMEOUT as PIRATE_REQUEST_SECONDS
 from .settings import EnvironmentSettings
 
-
-# Beyond the worker's 103 s foreground budget, including settlement margin.
-WORKER_REQUEST_TIMEOUT = 110.0
 SOCKET_CLOSE_TIMEOUT = 2.0
-PIRATE_REQUEST_TIMEOUT = 7.0
-# The worker gives a service CALL_TIMEOUT_SECONDS; the control plane waits for
-# the worker's answer that long plus the socket round trip, so the worker's
-# own timeout (which says the call may have run) is what the caller sees.
-SERVICE_WORKER_MARGIN_SECONDS = 2.0
-SERVICE_REQUEST_TIMEOUT = CALL_TIMEOUT_SECONDS + SERVICE_WORKER_MARGIN_SECONDS
+# Every request carries its budget (deadlines.py); the control plane waits for the
+# worker's answer that budget plus REPLY_MARGIN_SECONDS, so the worker's own
+# deadline (which says what may have run) is what the caller sees.
 
 
 def _response_result(response: dict[str, object]) -> dict[str, object]:
@@ -43,10 +40,12 @@ class WorkerClient:
     def __init__(self, environments: dict[str, EnvironmentSettings]) -> None:
         self.environments = environments
 
-    async def request(self, environment: str, operation: str, **arguments) -> dict[str, object]:
+    async def request(self, environment: str, operation: str, *, budget: float = FOREGROUND_REQUEST_SECONDS,
+                      **arguments) -> dict[str, object]:
         try:
             return await asyncio.wait_for(
-                self._request(environment, operation, **arguments), WORKER_REQUEST_TIMEOUT)
+                self._request(environment, operation, budget_seconds=budget, **arguments),
+                budget + REPLY_MARGIN_SECONDS)
         except asyncio.TimeoutError as error:
             raise FailureReport("worker request deadline exceeded; the operation may have run") from error
 
@@ -78,13 +77,7 @@ class WorkerClient:
 
     async def _pirate_request(self, environment: str, operation: str,
                               **arguments) -> dict[str, object]:
-        try:
-            return await asyncio.wait_for(
-                self.request(environment, operation, **arguments),
-                PIRATE_REQUEST_TIMEOUT,
-            )
-        except asyncio.TimeoutError as error:
-            raise FailureReport("Pirate worker request deadline exceeded; the operation may have run") from error
+        return await self.request(environment, operation, budget=PIRATE_REQUEST_SECONDS, **arguments)
 
     async def service_list(self, environment: str) -> dict[str, object]:
         return await self._service_request(environment, "service_list")
@@ -102,17 +95,16 @@ class WorkerClient:
                                            token=token)
 
     async def service_call(self, environment: str, service: str, tool: str,
-                           arguments: dict[str, object], token: str) -> dict[str, object]:
+                           arguments: dict[str, object], token: str,
+                           save_to: dict[str, object] | None = None) -> dict[str, object]:
+        extra = {} if save_to is None else {"save_to": save_to}
         return await self._service_request(environment, "service_call", service=service,
-                                           tool=tool, arguments=arguments, token=token)
+                                           tool=tool, arguments=arguments, token=token,
+                                           budget=SERVICE_OPERATION_SECONDS, **extra)
 
-    async def _service_request(self, environment: str, operation: str,
+    async def _service_request(self, environment: str, operation: str, budget: float = CALL_TIMEOUT_SECONDS,
                                **arguments: object) -> dict[str, object]:
-        try:
-            return await asyncio.wait_for(self.request(environment, operation, **arguments),
-                                          SERVICE_REQUEST_TIMEOUT)
-        except asyncio.TimeoutError as error:
-            raise FailureReport("service worker deadline exceeded; the call may have run") from error
+        return await self.request(environment, operation, budget=budget, **arguments)
 
     async def pirate_list(self, environment: str) -> dict[str, object]:
         return await self._pirate_request(environment, "list_pirates")
@@ -122,8 +114,10 @@ class WorkerClient:
         return await self._pirate_request(environment, "pirate_describe",
                                           pirate=pirate, flavour=flavour)
 
-    async def batch(self, environment: str, batch: dict[str, object]) -> dict[str, object]:
-        return await self.request(environment, "batch", batch=batch)
+    async def batch(self, environment: str, batch: dict[str, object],
+                    service_tokens: dict[str, str] | None = None) -> dict[str, object]:
+        extra = {"service_tokens": service_tokens} if service_tokens else {}
+        return await self.request(environment, "batch", batch=batch, **extra)
 
     async def file_call(self, environment: str, operation: str, **arguments) -> dict[str, object]:
         return await self.request(environment, operation, **arguments)
@@ -153,13 +147,14 @@ class WorkerClient:
 
     async def job_wait(self, environment: str, job_ids: list[str],
                        wait_seconds: float) -> dict[str, object]:
-        # The worker itself waits up to wait_seconds; give the socket round
-        # trip room beyond that instead of racing it with a fixed budget.
+        # The worker itself waits up to wait_seconds. job_wait only reads, so
+        # its own deadline (wait plus the reply margin) fires before the
+        # request's and can say that nothing was changed.
         try:
             return await asyncio.wait_for(
-                self.request(environment, "job_wait", job_ids=job_ids,
-                             wait_seconds=wait_seconds),
-                wait_seconds + PIRATE_REQUEST_TIMEOUT,
+                self.request(environment, "job_wait", budget=wait_seconds + REPLY_MARGIN_SECONDS,
+                             job_ids=job_ids, wait_seconds=wait_seconds),
+                wait_seconds + REPLY_MARGIN_SECONDS,
             )
         except asyncio.TimeoutError as error:
             raise FailureReport("job_wait worker deadline exceeded; nothing was changed") from error

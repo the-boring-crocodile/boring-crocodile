@@ -8,12 +8,16 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from boring_worker_kit.batch_contracts import BATCH_RESULT_BYTES, BatchRequest, admit_batch
+from boring_worker_kit.batch_contracts import BATCH_RESULT_BYTES
+
+from .batch_steps import PondBatchRequest, admit
+from boring_worker_kit.file_refs import prepare_call
 from boring_worker_kit.framing import MAX_FRAME_BYTES
 from boring_worker_kit.observation import Observation
 from .outcomes import Refusal
 from boring_worker_kit.execution import prepare_command
 from boring_worker_kit.task_client import ContainmentError
+from boring_worker_kit.services import ServiceFailure
 
 if TYPE_CHECKING:
     from .worker import WorkerServer
@@ -21,8 +25,8 @@ if TYPE_CHECKING:
 FILE_METHODS = frozenset({"file_read", "file_write", "file_patch", "file_list", "file_search", "file_read_bytes", "file_write_bytes"})
 JOB_METHODS = frozenset({"job_start", "job_list", "job_status", "job_output", "job_stop",
                          "job_wait"})
-# Only the registry view: a service call needs a token the control plane mints
-# for that one call, so service_describe and service_call are not batch steps.
+# The registry view. service_call is a step too (batch_steps.py), with the token
+# the control plane minted for that step; service_describe is not a step.
 SERVICE_METHODS = frozenset({"service_list"})
 RESERVED_BYTES = 8192
 _RESULT_CEILING = min(BATCH_RESULT_BYTES, MAX_FRAME_BYTES)
@@ -31,6 +35,14 @@ _RECEIPT_KEYS = ("job_id", "state")
 
 def _size(value: object) -> int:
     return len(json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("utf-8"))
+
+
+SAVE_PROBLEMS = ("save_to_refused", "save_to_failed")
+
+
+def _save_problem(result: dict[str, object]) -> str | None:
+    """The code of a service_call's save_to that did not land, or None."""
+    return next((code for code in SAVE_PROBLEMS if code in result), None)
 
 
 def _trim_result(value: dict[str, object], allowance: int) -> tuple[dict[str, object], bool]:
@@ -59,7 +71,11 @@ def _trim_result(value: dict[str, object], allowance: int) -> tuple[dict[str, ob
             break
         cap //= 2
     # Unknown owner result shape: never discard its receipt or fabricate success.
-    essentials = {key: value[key] for key in ("job_id", "sha256", "bytes", "state", "exit_code", "timed_out") if key in value}
+    # A service step's save outcome says whether the service ran and what became of the
+    # file: it is never dropped with the answer.
+    essentials = {key: value[key] for key in ("job_id", "sha256", "bytes", "state", "exit_code", "timed_out",
+                                              "saved_to", "save_to_refused", "save_to_failed", "service_ran",
+                                              "answer_bytes") if key in value}
     essentials["result_omitted"] = True
     return essentials, True
 
@@ -76,8 +92,9 @@ class BatchRunner:
     def __init__(self, worker: "WorkerServer") -> None:
         self.worker = worker
 
-    def prepare(self, raw: object) -> tuple[BatchRequest, list[tuple[str, str, dict[str, object]]]]:
-        batch = admit_batch(raw)
+    def prepare(self, raw: object, service_tokens: dict[str, str] | None = None
+                ) -> tuple[PondBatchRequest, list[tuple[str, str, dict[str, object]]]]:
+        batch = admit(raw)
         steps: list[tuple[str, str, dict[str, object]]] = []
         for item in batch.operations:
             method = item.method
@@ -96,6 +113,13 @@ class BatchRunner:
                     assert self.worker.executor is not None
                     prepare_command(self.worker.settings, arguments["command"], arguments.get("cwd"),
                                     arguments.get("timeout_seconds"), self.worker.executor.limits, is_job=True)
+            elif method == "service_call":
+                token = (service_tokens or {}).get(item.id)
+                if token is None:
+                    raise Refusal("forbidden", "a service_call step runs only in a direct batch, with the token "
+                                  "the control plane mints for it; not in a job's operations")
+                prepare_call(self.worker.files, arguments.get("arguments"), arguments.get("save_to"))
+                arguments = {**arguments, "token": token}
             elif method in SERVICE_METHODS:
                 pass  # The registry view needs no admission check.
             steps.append((item.id, method, arguments))
@@ -103,12 +127,13 @@ class BatchRunner:
 
     async def run(self, raw: object, *, foreground_cap: float = 103.0,
                   job_id: str | None = None,
-                  on_output: Callable[[dict[str, object]], None] | None = None) -> dict[str, object]:
+                  on_output: Callable[[dict[str, object]], None] | None = None,
+                  service_tokens: dict[str, str] | None = None) -> dict[str, object]:
         # foreground_cap is 103 (the synchronous batch tool's own hard ceiling)
         # for a direct batch call. A background job (job_id given) passes its
         # own, much longer, job-level cap here instead -- everything else
         # about running the steps is identical.
-        batch, steps = self.prepare(raw)
+        batch, steps = self.prepare(raw, service_tokens)
         started = asyncio.get_running_loop().time()
         budget = min(foreground_cap, batch.timeout_seconds or foreground_cap)
         if job_id is None and any(method == "exec" for _, method, _ in steps):
@@ -145,7 +170,14 @@ class BatchRunner:
                                       job_id=job_id, on_output=on_output), timeout=remaining)
                     failure = method == "exec" and (result.get("exit_code") != 0 or
                         result.get("timed_out") is True)
-                    entry["status"] = "failed" if failure else "succeeded"
+                    # A service that answered while its save_to did not land (refused,
+                    # failed, or unknown): the call ran, so its answer stays in the
+                    # result unchanged, but the step is not a success and on_error
+                    # decides whether later steps run (review finding F1, 2026-10-25).
+                    save = _save_problem(result) if method == "service_call" else None
+                    if save is not None:
+                        entry["code"] = save
+                    entry["status"] = "failed" if failure or save is not None else "succeeded"
                     available = BATCH_RESULT_BYTES - _size(entries) - RESERVED_BYTES - 1024
                     entry["result"], entry["result_truncated"] = _trim_result(result, max(available, 256))
                     if entry["result_truncated"] and stop_reason is None:
@@ -153,9 +185,18 @@ class BatchRunner:
                 except Refusal as refusal:
                     # A normal outcome of this step, carried as data with its code.
                     entry.update(status="refused", refusal=refusal.as_data())
-                except asyncio.TimeoutError:
-                    entry.update(status="unknown", error="batch deadline; operation outcome may be unknown")
-                    stop_reason = "deadline"
+                except (asyncio.TimeoutError, TimeoutError):
+                    # Both: Common's service client raises the built-in TimeoutError, which
+                    # is asyncio.TimeoutError only from Python 3.11 on.
+                    if asyncio.get_running_loop().time() < deadline - 0.05:
+                        # The step's own deadline (a service's 30 s), not the batch's: on_error decides.
+                        entry.update(status="unknown", error="the step's own deadline passed; it may have run")
+                    else:
+                        entry.update(status="unknown", error="batch deadline; operation outcome may be unknown")
+                        stop_reason = "deadline"
+                except ServiceFailure as failure:
+                    # The service's structured failure, whole, as the service_call tool gives it.
+                    entry.update(status="failed", failure=failure.data)
                 except ContainmentError:
                     entry.update(status="unknown", error="command cleanup not confirmed")
                     stop_reason = "cleanup_unconfirmed"
@@ -169,7 +210,7 @@ class BatchRunner:
                               exit_code=result.get("exit_code") if "result" in entry else None)
                 if stop_reason:
                     break
-                if entry["status"] in ("failed", "refused") and batch.on_error == "stop":
+                if entry["status"] in ("failed", "refused", "unknown") and batch.on_error == "stop":
                     stop_reason = "step_refused" if entry["status"] == "refused" else "step_failed"
                     break
             for skipped_index, (identifier, method, _) in enumerate(steps[len(entries):], len(entries) + 1):

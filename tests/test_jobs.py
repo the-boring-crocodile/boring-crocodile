@@ -313,7 +313,7 @@ class JobProtocolTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_foreground_runner_disconnect_returns_error_frame(self):
         class BrokenExecutor:
-            async def execute(self, command, cwd, timeout):
+            async def execute(self, command, cwd, timeout, **deadline):
                 raise asyncio.IncompleteReadError(b"", 4)
 
         self.worker.executor = BrokenExecutor()

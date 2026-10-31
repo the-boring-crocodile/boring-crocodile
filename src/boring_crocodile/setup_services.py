@@ -1,10 +1,8 @@
 """Render service configuration from completed setup and explicit host policy.
 
 Pure rendering has no Debian dependency; runtime_root is supplied by the site configuration.
-The CLI writes a new candidate directory only. It never installs or activates.
 """
 from __future__ import annotations
-import argparse
 from dataclasses import dataclass
 from importlib.resources import files
 import ipaddress
@@ -14,8 +12,7 @@ import re
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from .setup import SetupInputs, account, group, unique_object
-from .settings import Settings
+from .setup import SetupInputs
 from .task_policy import task_directives
 from .site_layout import CONTROL_CREDENTIALS, CREDENTIALS_DIR, INITIAL_POND, OAUTH_DATABASE, approval_credential, budget_slice, tmpfiles_name
 
@@ -235,62 +232,3 @@ def render_site(entries):
     output["boring-crocodile-mcp.service"] = control
     output["boring-crocodile-mcp.target"] = render(first_setup, first_policy, first_receipt)["boring-crocodile-mcp.target"]
     return output
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--receipt", type=Path)
-    mode.add_argument("--site", type=Path, help="JSON list of receipt/service_inputs file pairs")
-    parser.add_argument("--service-inputs", type=Path)
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args(argv)
-    try:
-        if args.site:
-            if args.service_inputs:
-                raise ValueError("--site supplies per-Pond service inputs")
-            pairs = json.loads(args.site.read_text(), object_pairs_hook=unique_object)
-            if not isinstance(pairs, list) or not pairs:
-                raise ValueError("Site manifest must be a nonempty list")
-        else:
-            if args.service_inputs is None:
-                raise ValueError("--receipt requires --service-inputs")
-            pairs = [{"receipt": str(args.receipt), "service_inputs": str(args.service_inputs)}]
-        entries = []
-        for pair in pairs:
-            if set(pair) != {"receipt", "service_inputs"}:
-                raise ValueError("Each site entry needs receipt and service_inputs paths")
-            receipt = json.loads(Path(pair["receipt"]).read_text(), object_pairs_hook=unique_object)
-            setup = SetupInputs.parse(receipt["inputs"])
-            policy = ServiceInputs.parse(json.loads(Path(pair["service_inputs"]).read_text(), object_pairs_hook=unique_object))
-            for name in (setup.execution_user, setup.control_user):
-                if account(name) != receipt["users"][name]:
-                    raise ValueError("Host identity differs from completed setup: " + name)
-            for name, expected in receipt["groups"].items():
-                if group(name) != expected:
-                    raise ValueError("Host group differs from completed setup: " + name)
-            entries.append((setup, policy, receipt))
-        if args.site:
-            from .setup_apply import Host, site_receipts, validate_site
-            recorded = site_receipts(Host())
-            validate_site(Host(), recorded, None)
-            supplied = {r.get("pond_name", INITIAL_POND): r for _, _, r in entries}
-            if supplied != recorded:
-                raise ValueError("Site manifest must match all recorded Ponds")
-            rendered = render_site(entries)
-        else:
-            rendered = render(*entries[0])
-        # Never overwrite an existing candidate or live configuration directory.
-        args.output.mkdir(mode=0o700)
-        for name, text in rendered.items():
-            with (args.output/name).open("x") as stream:
-                stream.write(text)
-        Settings.load(args.output/"config.toml")
-        print(json.dumps({"candidate":str(args.output), "files":sorted(rendered),
-                          "installed":False, "activated":False}))
-        return 0
-    except (KeyError, ValueError, OSError) as error:
-        print("Service rendering failed: " + str(error), file=__import__("sys").stderr)
-        return 2
-
-if __name__ == "__main__":
-    raise SystemExit(main())
