@@ -18,6 +18,11 @@ use, and should keep coming from use.
 Part of the [Pond family](https://github.com/the-boring-crocodile/boring-pond/blob/main/README.md); shared libraries from
 [Pond Common](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/README.md).
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/crocodile-dark.svg">
+  <img alt="The Crocodile, one server with a Unix account per Pond: Claude, signed in to the Pond pond, and ChatGPT or VS Code, signed in to garden, call the controller over MCP; the controller, in the control account with its sign-in store, where tokens are kept only as SHA-256, hands each call over a local socket to its Pond's worker, one per Pond in that Pond's own account. A worker runs each command in a task runner, a systemd unit with a deadline and a cgroup, hands assignments to Pirates and calls services with short-lived tokens from the controller; every worker does all three, each drawn once." src="docs/crocodile.svg">
+</picture>
+
 ## Documentation
 
 | | |
@@ -54,7 +59,9 @@ refused by name. A refusal is `{code, message, ...}`, a failure `{failure}`.
 
 The Crocodile's accounts are ordinary, unprivileged users. If one ever holds
 authority it should not (root, sudo, another account's files), that is a
-misconfiguration to fix, never a feature to build on.
+misconfiguration to fix, never a feature to build on. The one exception is
+chosen, not found: a Pond you give host administration on purpose
+([PERMISSIONS](docs/PERMISSIONS.md#widening-host-administration-by-a-pond)).
 
 ## Development checks
 
