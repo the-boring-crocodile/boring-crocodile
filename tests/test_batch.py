@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 from unittest.mock import patch
 import unittest
 
@@ -314,9 +315,12 @@ class BatchSocketTest(unittest.IsolatedAsyncioTestCase):
         receipt = result["results"][0]["result"]
         self.assertEqual(result["results"][0]["status"], "succeeded", result)
         self.assertEqual(result["results"][1]["status"], "succeeded")
-        for _ in range(100):
+        # A real process: give a slow CI runner time (a fixed 1 s was too
+        # short on GitHub's Python 3.14 runner); the loop ends when it settles.
+        deadline = time.monotonic() + 15
+        while True:
             current = self.worker.jobs.output(receipt["job_id"])
-            if current["state"] in ("completed", "failed", "cancelled"):
+            if current["state"] in ("completed", "failed", "cancelled") or time.monotonic() > deadline:
                 break
             await asyncio.sleep(.01)
         self.assertEqual(current["state"], "completed")

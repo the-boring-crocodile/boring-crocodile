@@ -25,16 +25,28 @@ service `canvas`. Put your own values where these appear.
   forwards the Crocodile's paths to `127.0.0.1:8503` (the list: [The reverse
   proxy](#the-reverse-proxy) below). DNS, TLS, the proxy
   and the firewall are yours; setup does not touch them.
-- The release artifact `boring-crocodile-VERSION-linux-x86_64.tar.gz` from a
-  trusted source, with its published SHA-256 (VERSION: the release you install).
+- `curl`, and the release from the [releases page](https://github.com/the-boring-crocodile/boring-crocodile/releases):
+  the archive `boring-crocodile-V-linux-x86_64.tar.gz` and its `.sha256` file
+  (tag `vV`); step 1 downloads both. The checksum detects a
+  damaged download, not who built it; the releases carry no signatures or
+  attestations yet. Versions tested together:
+  [releases and versions](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/updating.md#releases-and-versions).
 
 ## 1. Deploy the runtime
 
-    sha256sum boring-crocodile-VERSION-linux-x86_64.tar.gz   # compare with the published value
-    sudo mkdir -p /root/releases                              # unpack as root, where only root can write
-    sudo tar xzf boring-crocodile-VERSION-linux-x86_64.tar.gz -C /root/releases
-    sudo install -d -m 0755 /opt/boring-crocodile             # the deploy refuses a HOME that does not exist
-    sudo /root/releases/boring-crocodile-VERSION/deploy
+One block, from the download to the deploy; set `V` to the release you
+install (the newest is on the releases page) and run it in one shell:
+
+    V=0.4.20
+    f=boring-crocodile-$V-linux-x86_64.tar.gz
+    u=https://github.com/the-boring-crocodile/boring-crocodile/releases/download/v$V
+    mkdir -p ~/Downloads && cd ~/Downloads
+    curl -fLO "$u/$f" && curl -fLO "$u/$f.sha256" &&
+    sha256sum -c "$f.sha256" &&            # must print OK; if not, the block stops here
+    sudo mkdir -p /root/releases &&
+    sudo tar xzf "$f" -C /root/releases &&
+    sudo install -d -m 0755 /opt/boring-crocodile &&   # the deploy refuses an install folder that does not exist
+    sudo /root/releases/boring-crocodile-$V/deploy
 
 The deploy installs the runtime under `/opt/boring-crocodile/current` and
 nothing else: no accounts, no credentials, no running service. How deploy,
@@ -135,7 +147,7 @@ Either way, activation writes `/etc/boring-crocodile/config.toml` (each Pond
 with its home as the file root its file tools may read and write), the systemd
 units, slice and tmpfiles rules, and the Pond's approval credential
 `/etc/boring-crocodile/credentials/approval-secret` (mode 0600). It starts the
-site and watches local health for about ten seconds; a site that stays
+site and watches local health for up to a minute; a site that stays
 unhealthy is reported as `configured_but_degraded`.
 
 ### The reverse proxy

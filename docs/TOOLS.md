@@ -41,7 +41,7 @@ environment; `pond_limits` the task slots, the foreground budget and
 Off unless the Pond's environment has a `files` section. Each root is an
 absolute path with `read` and `write` (write needs read) and optional `deny`
 subtrees (invisible); `files.limits` overrides the ceilings in
-`file_policy.py`. Unix permissions still apply, and setup never widens them.
+[`file_policy.py`](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/packages/boring-worker-kit/src/boring_worker_kit/file_policy.py). Unix permissions still apply, and setup never widens them.
 
 **Paths** are relative to a named root; `.` only for list and search. Refused:
 `..`, `.`, empty components, `.git`, `.pirate-*`, `.boring-file-*`, absolute

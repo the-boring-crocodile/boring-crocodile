@@ -128,7 +128,7 @@ succeed returns the answer with `save_to_refused` (nothing written) or
 `save_to_failed` (`effects: unknown`: the write failed or did not finish in
 time and may still land). Inside a batch that step is `failed` with `code`
 (the save outcome's name) and keeps the answer in its `result`, so `on_error:
-stop` stops before a step that would rely on the file (review finding F1, 2026-10-25).
+stop` stops before a step that would rely on the file.
 The agent-facing rules are in the guide.
 
 ### Time

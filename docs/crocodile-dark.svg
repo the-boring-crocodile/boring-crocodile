@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="692pt" height="801pt" viewBox="0 0 692 801">
+<rect x="0" y="0" width="692" height="801" fill="#121212"/>
+<text x="20.0" y="36.0" font-family="Helvetica,Arial,sans-serif" font-size="18" font-weight="bold" fill="#dfdfdf" xml:space="preserve">The Crocodile: one server, a Unix account per Pond</text>
+<text x="20.0" y="56.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">Container view · Crocodile 0.4.20</text>
+<text x="20.0" y="72.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">A client signs in to one Pond; the token picks the Pond; the Pond's account does the work.</text>
+<g class="cluster"><rect x="8" y="232" width="438" height="113" fill="none" stroke="#656c69" stroke-width="1"/>
+<text x="18.0" y="335.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">Control account</text>
+</g>
+<g class="cluster"><rect x="8" y="382" width="216" height="253" fill="none" stroke="#656c69" stroke-width="1"/>
+<text x="18.0" y="625.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">The Pond's account: pond</text>
+</g>
+<g class="cluster"><rect x="452" y="382" width="216" height="98" fill="none" stroke="#656c69" stroke-width="1"/>
+<text x="462.0" y="470.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">The Pond's account: garden</text>
+</g>
+<g class="edge"><title>claude->controller</title><path fill="none" stroke="#6f8da4" stroke-width="1.4" d="M171.5,174.0 L274.9,239.2"/><polygon fill="#6f8da4" stroke="#6f8da4" points="282.5,244.0 277.0,235.8 272.8,242.6"/></g>
+<g class="edge"><title>chatgpt->controller</title><path fill="none" stroke="#6f8da4" stroke-width="1.4" d="M504.5,174.0 L401.1,239.2"/><polygon fill="#6f8da4" stroke="#6f8da4" points="393.5,244.0 403.2,242.6 399.0,235.8"/></g>
+<g class="edge"><title>controller->store</title><path fill="none" stroke="#9d7f58" stroke-dasharray="1.5,4" stroke-linecap="round" stroke-width="2" d="M242.0,279.0 L221.0,279.0"/><polygon fill="#9d7f58" stroke="#9d7f58" points="212.0,279.0 221.0,283.0 221.0,275.0"/></g>
+<g class="edge"><title>controller->wp</title><path fill="none" stroke="#9d7f58" stroke-dasharray="1.5,4" stroke-linecap="round" stroke-width="2" d="M286.2,314.0 L175.3,389.0"/><polygon fill="#9d7f58" stroke="#9d7f58" points="167.8,394.0 177.5,392.3 173.0,385.6"/></g>
+<g class="edge"><title>controller->wg</title><path fill="none" stroke="#9d7f58" stroke-dasharray="1.5,4" stroke-linecap="round" stroke-width="2" d="M392.5,314.0 L509.6,389.1"/><polygon fill="#9d7f58" stroke="#9d7f58" points="517.2,394.0 511.7,385.8 507.4,392.5"/></g>
+<g class="edge"><title>wp->runner</title><path fill="none" stroke="#9d7f58" stroke-dasharray="1.5,4" stroke-linecap="round" stroke-width="2" d="M116.0,464.0 L116.0,525.0"/><polygon fill="#9d7f58" stroke="#9d7f58" points="116.0,534.0 120.0,525.0 112.0,525.0"/></g>
+<g class="edge"><title>wp->pirates</title><path fill="none" stroke="#9d7f58" stroke-dasharray="1.5,4" stroke-linecap="round" stroke-width="2" d="M174.6,464.0 L284.2,529.4"/><polygon fill="#9d7f58" stroke="#9d7f58" points="291.9,534.0 286.2,526.0 282.1,532.8"/></g>
+<g class="edge"><title>wg->services</title><path fill="none" stroke="#6f8da4" stroke-width="1.4" d="M560.0,449.0 L560.0,525.0"/><polygon fill="#6f8da4" stroke="#6f8da4" points="560.0,534.0 564.0,525.0 556.0,525.0"/></g>
+<g class="node"><title>claude</title><rect x="20" y="104" width="192" height="70" fill="#1a1e25" stroke="#697c94" stroke-width="1.2"/>
+<text x="30.0" y="122.0" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="bold" fill="#dfdfdf" xml:space="preserve">Claude</text>
+<text x="30.0" y="137.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">[AI client]</text>
+<text x="30.0" y="152.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">signed in to the Pond</text>
+<text x="30.0" y="167.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">pond</text>
+<path transform="translate(180,112) scale(0.917)" d="M3.5 4.5h17v11.5H10l-5 4v-4H3.5z M7.5 9h9 M7.5 12h6" fill="none" stroke="#697c94" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="node"><title>chatgpt</title><rect x="464" y="104" width="192" height="70" fill="#1a1e25" stroke="#697c94" stroke-width="1.2"/>
+<text x="474.0" y="122.0" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="bold" fill="#dfdfdf" xml:space="preserve">ChatGPT, VS Code</text>
+<text x="474.0" y="137.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">[AI client]</text>
+<text x="474.0" y="152.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">signed in to the Pond</text>
+<text x="474.0" y="167.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">garden</text>
+<path transform="translate(624,112) scale(0.917)" d="M3.5 4.5h17v11.5H10l-5 4v-4H3.5z M7.5 9h9 M7.5 12h6" fill="none" stroke="#697c94" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="node"><title>store</title><rect x="20" y="244" width="192" height="70" fill="#171e19" stroke="#5f7867" stroke-width="1.2"/>
+<text x="30.0" y="262.0" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="bold" fill="#dfdfdf" xml:space="preserve">Sign-in store</text>
+<text x="30.0" y="277.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">[SQLite]</text>
+<text x="30.0" y="292.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">clients, approvals; tokens</text>
+<text x="30.0" y="307.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">kept only as SHA-256</text>
+<path transform="translate(180,252) scale(0.917)" d="M6 2.5h8.5l4 4v15H6z M14.5 2.5v4h4 M9 12h6 M9 15.5h6" fill="none" stroke="#5f7867" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="node"><title>controller</title><rect x="242" y="244" width="192" height="70" fill="#171e19" stroke="#5f7867" stroke-width="1.2"/>
+<text x="252.0" y="262.0" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="bold" fill="#dfdfdf" xml:space="preserve">Controller</text>
+<text x="252.0" y="277.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">[boring-crocodile-mcp]</text>
+<text x="252.0" y="292.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">one URL per Pond; runs no</text>
+<text x="252.0" y="307.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">commands, holds no files</text>
+<path transform="translate(402,252) scale(0.917)" d="M9 6.5 3.5 12 9 17.5 M15 6.5 20.5 12 15 17.5" fill="none" stroke="#5f7867" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="node"><title>wp</title><rect x="20" y="394" width="192" height="70" fill="#171e19" stroke="#5f7867" stroke-width="1.2"/>
+<text x="30.0" y="412.0" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="bold" fill="#dfdfdf" xml:space="preserve">Worker · pond</text>
+<text x="30.0" y="427.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">[worker · Python]</text>
+<text x="30.0" y="442.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">handbook, files, jobs;</text>
+<text x="30.0" y="457.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">never switches users</text>
+<path transform="translate(180,402) scale(0.917)" d="M9 6.5 3.5 12 9 17.5 M15 6.5 20.5 12 15 17.5" fill="none" stroke="#5f7867" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="node"><title>wg</title><rect x="464" y="394" width="192" height="55" fill="#171e19" stroke="#5f7867" stroke-width="1.2"/>
+<text x="474.0" y="412.0" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="bold" fill="#dfdfdf" xml:space="preserve">Worker · garden</text>
+<text x="474.0" y="427.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">[worker · Python]</text>
+<text x="474.0" y="442.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">the same, for garden</text>
+<path transform="translate(624,402) scale(0.917)" d="M9 6.5 3.5 12 9 17.5 M15 6.5 20.5 12 15 17.5" fill="none" stroke="#5f7867" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="node"><title>runner</title><rect x="20" y="534" width="192" height="70" fill="#171e19" stroke="#5f7867" stroke-width="1.2"/>
+<text x="30.0" y="552.0" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="bold" fill="#dfdfdf" xml:space="preserve">Task runner</text>
+<text x="30.0" y="567.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">[systemd unit]</text>
+<text x="30.0" y="582.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">one per command, with a</text>
+<text x="30.0" y="597.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">deadline and a cgroup</text>
+<path transform="translate(180,542) scale(0.917)" d="M12 2.5a9.5 9.5 0 1 1 0 19a9.5 9.5 0 1 1 0-19z M10 8l6 4-6 4z" fill="none" stroke="#5f7867" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="node"><title>pirates</title><rect x="242" y="534" width="192" height="55" fill="#171e19" stroke="#5f7867" stroke-width="1.2"/>
+<text x="252.0" y="552.0" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="bold" fill="#dfdfdf" xml:space="preserve">Pirates</text>
+<text x="252.0" y="567.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">[agents · own accounts]</text>
+<text x="252.0" y="582.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">take assignments as jobs</text>
+<path transform="translate(402,542) scale(0.917)" d="M5.5 8.5h13v11h-13z M12 4.5v4 M9.5 13.5v1 M14.5 13.5v1 M9.5 17h5 M3 13v3 M21 13v3" fill="none" stroke="#5f7867" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
+<g class="node"><title>services</title><rect x="464" y="534" width="192" height="70" fill="#171e19" stroke="#5f7867" stroke-width="1.2"/>
+<text x="474.0" y="552.0" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="bold" fill="#dfdfdf" xml:space="preserve">Services</text>
+<text x="474.0" y="567.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">[MCP servers · granted]</text>
+<text x="474.0" y="582.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">short-lived tokens from</text>
+<text x="474.0" y="597.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">the controller</text>
+<path transform="translate(624,542) scale(0.917)" d="M9 6.5 3.5 12 9 17.5 M15 6.5 20.5 12 15 17.5" fill="none" stroke="#5f7867" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
+<text x="20.0" y="669.0" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="bold" fill="#dfdfdf" xml:space="preserve">Read the picture</text>
+<text x="20.0" y="685.0" font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="bold" fill="#7b9682" xml:space="preserve">Sage box · the Pond family</text>
+<text x="20.0" y="701.0" font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="bold" fill="#7f95b5" xml:space="preserve">Pale blue box · a person, their client</text>
+<text x="20.0" y="717.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">Frame: its label says what it is</text>
+<text x="20.0" y="733.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">Arrow: from caller to callee</text>
+<text x="242.0" y="669.0" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="bold" fill="#dfdfdf" xml:space="preserve">Lines</text>
+<text x="242.0" y="685.0" font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="bold" fill="#6f8da4" xml:space="preserve">Blue · MCP, wherever it runs</text>
+<text x="242.0" y="701.0" font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="bold" fill="#9d7f58" xml:space="preserve">Dotted ochre · not MCP, local:</text>
+<text x="242.0" y="717.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">a socket, a file, a command</text>
+<text x="464.0" y="669.0" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="bold" fill="#dfdfdf" xml:space="preserve">Scope and limits</text>
+<text x="464.0" y="685.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">A Pond is trusted like a person with</text>
+<text x="464.0" y="701.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">an account: no command filter; the</text>
+<text x="464.0" y="717.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">account is the boundary. Each worker</text>
+<text x="464.0" y="733.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">reaches its Pirates and services;</text>
+<text x="464.0" y="749.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">drawn once each. Proxy and sign-in:</text>
+<text x="464.0" y="765.0" font-family="Helvetica,Arial,sans-serif" font-size="10" fill="#dfdfdf" xml:space="preserve">boring-pond's architecture page.</text>
+</svg>
