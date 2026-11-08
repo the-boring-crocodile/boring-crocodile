@@ -18,7 +18,7 @@ service `canvas`. Put your own values where these appear.
 
 ## Before you start
 
-- A Linux host with systemd and cgroup v2, and `python3` 3.11 or newer (only to
+- An **x86_64 Linux** host with systemd and cgroup v2, and `python3` 3.11 or newer (only to
   run the deploy, which refuses an older one; the runtime brings its own Python).
 - sudo, and a root-owned parent directory for the Pond homes (here `/home`).
 - `https://crocodile-url.example.test` served by your reverse proxy, which
@@ -28,16 +28,24 @@ service `canvas`. Put your own values where these appear.
 - `curl`, and the release from the [releases page](https://github.com/the-boring-crocodile/boring-crocodile/releases):
   the archive `boring-crocodile-V-linux-x86_64.tar.gz` and its `.sha256` file
   (tag `vV`); step 1 downloads both. The checksum detects a
-  damaged download, not who built it; the releases carry no signatures or
-  attestations yet. Versions tested together:
+  damaged download; a checksum from the same page does not authenticate its
+  origin. Versions tested together:
   [releases and versions](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/updating.md#releases-and-versions).
+
+The memory ceiling proposed at activation is a quarter of host RAM, clamped
+to 512 MiB–8 GiB per Pond. It reserves no RAM and is not a total-host sizing
+recommendation. Leave room for simultaneous workers, retained releases and
+their state; services and model inference add their own requirements.
+[Linux prerequisites and costs](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/installation.md#what-you-need)
+covers the whole site. Docker is needed by the service deploys, not by this
+systemd runtime.
 
 ## 1. Deploy the runtime
 
 One block, from the download to the deploy; set `V` to the release you
 install (the newest is on the releases page) and run it in one shell:
 
-    V=0.4.20
+    V=0.4.21
     f=boring-crocodile-$V-linux-x86_64.tar.gz
     u=https://github.com/the-boring-crocodile/boring-crocodile/releases/download/v$V
     mkdir -p ~/Downloads && cd ~/Downloads
