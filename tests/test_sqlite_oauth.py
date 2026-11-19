@@ -27,7 +27,7 @@ class PersistenceTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.secret = self.root / 'secret'
-        self.secret.write_text('test-only-secret')
+        self.secret.write_text('test-only-approval-secret')
         self.database = self.root / 'oauth.sqlite3'
         self.provider = self.open()
         self.client = OAuthClientInformationFull(client_id='test-client', scope='mcp',
@@ -46,8 +46,8 @@ class PersistenceTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reopened.has_pending(request))
         self.assertEqual(reopened.approve(request, 'wrong', 'pond'),
                          Denied(403, "Wrong approval secret."))
-        callback = reopened.approve(request, 'test-only-secret', 'pond')
-        self.assertEqual(reopened.approve(request, 'test-only-secret', 'pond').status, 400)
+        callback = reopened.approve(request, 'test-only-approval-secret', 'pond')
+        self.assertEqual(reopened.approve(request, 'test-only-approval-secret', 'pond').status, 400)
         code = parse_qs(urlparse(callback).query)['code'][0]
         return await self.open().load_authorization_code(self.client, code)
 
@@ -72,11 +72,11 @@ class PersistenceTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Start the connection again", fifth.message)
         # Gone: even the right secret no longer approves it.
         self.assertFalse(self.provider.has_pending(request))
-        self.assertEqual(self.provider.approve(request, 'test-only-secret', 'pond').status, 400)
+        self.assertEqual(self.provider.approve(request, 'test-only-approval-secret', 'pond').status, 400)
         # The count is per pending request: another one is untouched.
         self.assertEqual(self.provider.approve(other, 'wrong', 'pond'),
                          Denied(403, "Wrong approval secret."))
-        self.assertIn('code=', self.provider.approve(other, 'test-only-secret', 'pond'))
+        self.assertIn('code=', self.provider.approve(other, 'test-only-approval-secret', 'pond'))
         self.assertEqual(self.provider.wrong_secrets, {})
 
     def other_client(self, name):
@@ -122,7 +122,7 @@ class PersistenceTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.provider.has_pending(second))
         self.assertTrue(self.provider.has_pending(third))
         self.assertTrue(self.provider.has_pending(b_first))
-        self.assertIn('code=', self.provider.approve(newest, 'test-only-secret', 'pond'))
+        self.assertIn('code=', self.provider.approve(newest, 'test-only-approval-secret', 'pond'))
 
     async def test_wrong_secrets_never_lock_out_the_right_one(self):
         for _ in range(6):
@@ -130,7 +130,7 @@ class PersistenceTest(unittest.IsolatedAsyncioTestCase):
             for _ in range(5):
                 self.provider.approve(request, 'wrong', 'pond')
         request = await self.pending_for(self.client)
-        self.assertIn('code=', self.provider.approve(request, 'test-only-secret', 'pond'))
+        self.assertIn('code=', self.provider.approve(request, 'test-only-approval-secret', 'pond'))
 
     async def test_process_restart(self):
         await self.provider.register_client(self.client)
@@ -255,7 +255,7 @@ asyncio.run(check())'''
             redirect_uri_provided_explicitly=True, resource='https://server.test/mcp/pond'))
         request = parse_qs(urlparse(url).query)['request'][0]
         stored_with_pending = self.database.read_bytes()
-        callback = self.provider.approve(request, 'test-only-secret', 'pond')
+        callback = self.provider.approve(request, 'test-only-approval-secret', 'pond')
         code_value = parse_qs(urlparse(callback).query)['code'][0]
         stored_with_code = self.database.read_bytes()
         code = await self.provider.load_authorization_code(self.client, code_value)
@@ -272,7 +272,7 @@ asyncio.run(check())'''
         self.assertEqual(refresh.token, issued.refresh_token)
 
     async def test_stores_of_another_schema_are_refused_unchanged(self):
-        for version in (1, 2, 3, 4):
+        for version in (1, 2, 3, 4, 7):
             old = self.root / f'v{version}.sqlite3'
             with sqlite3.connect(old) as db:
                 db.execute("CREATE TABLE records (kind TEXT NOT NULL, key TEXT NOT NULL, payload TEXT NOT NULL, "
@@ -281,7 +281,7 @@ asyncio.run(check())'''
                 db.execute(f"PRAGMA user_version={version}")
             os.chmod(old, 0o600)
             before = old.read_bytes()
-            with self.assertRaisesRegex(RuntimeError, f"schema {version}; this release reads schema 5"):
+            with self.assertRaisesRegex(RuntimeError, f"schema {version}; this release reads schema 6"):
                 self.open(old)
             self.assertEqual(old.read_bytes(), before)
 

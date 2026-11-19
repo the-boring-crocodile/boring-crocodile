@@ -23,7 +23,7 @@ from boring_crocodile.control_plane import create_http_app
 from boring_worker_kit.framing import read_frame, write_frame
 from boring_crocodile.settings import Settings, PondSettings
 from boring_crocodile.sqlite_oauth_provider import SQLiteOAuthProvider
-from pond_config import dynamic
+from pond_config import dynamic, runtime_settings
 
 
 class PondsTest(unittest.IsolatedAsyncioTestCase):
@@ -48,7 +48,7 @@ dynamic_registration = true
         for name in self.ids:
             (self.root / name).mkdir()
             (self.root / name / "contract.md").write_text(name + " private context")
-            (self.root / (name + ".secret")).write_text(name + "-test-secret")
+            (self.root / (name + ".secret")).write_text(name + "-test-secret-for-synthetic-tests")
             config += f'''
 [ponds.{name}]
 profile_id = "{self.ids[name]}"
@@ -67,7 +67,7 @@ control_plane_uid = 1000
 '''
         self.config = self.root / "config.toml"
         self.config.write_text(config)
-        self.settings = Settings.load(self.config)
+        self.settings = runtime_settings(self.config)
         self.provider = self.open()
         self.client = OAuthClientInformationFull(client_id="test-client", scope="mcp", token_endpoint_auth_method="none",
             redirect_uris=[AnyUrl("https://client.test/callback")])
@@ -104,13 +104,13 @@ control_plane_uid = 1000
                     elif operation == "pirate_describe":
                         result = {"flavour": request["flavour"], "limits": {"max_timeout_seconds": 60}}
                     if request.get("command") == "probe-not-admitted":
-                        await write_frame(writer, {"ok": False, "refusal": {
+                        await write_frame(writer, {"ok": False, "refusal": {"status": "refused",
                             "code": "not_admitted",
                             "message": "foreground admission timeout; command not started"}})
                     elif request.get("command") == "probe-interrupted":
-                        await write_frame(writer, {"ok": False, "failure": (
-                            "ForegroundInterrupted: foreground request deadline exceeded; "
-                            "task cleanup completed; command may have started")})
+                        await write_frame(writer, {"ok": False, "failure": {"status": "failed", "code": "foreground_interrupted",
+                            "message": "ForegroundInterrupted: foreground request deadline exceeded; "
+                            "task cleanup completed; command may have started", "effects": "unknown"}})
                     else:
                         await write_frame(writer, {"ok": True, "result": result})
                 finally:
@@ -141,7 +141,7 @@ control_plane_uid = 1000
 
     async def code(self, name, resource=None):
         request = await self.pending(resource or f"https://server.test/mcp/{name}")
-        callback = self.provider.approve(request, name + "-test-secret", name)
+        callback = self.provider.approve(request, name + "-test-secret-for-synthetic-tests", name)
         value = parse_qs(urlparse(callback).query)["code"][0]
         return await self.provider.load_authorization_code(self.client, value)
 
@@ -176,9 +176,8 @@ control_plane_uid = 1000
             self.assertNotIn("mcp_guide", body["handbook"])
             executed = await self.call(tokens[name], "exec", {"command": "overlap"})
             self.assertEqual(executed["structuredContent"]["worker"], name)
-            ping = await self.call(tokens[name], "pond_ping")
-            self.assertEqual(ping["structuredContent"]["environments"], [name])
-            self.assertEqual(ping["structuredContent"]["message"], f"authenticated {name} says <^==>")
+            self.assertEqual(body["capabilities"]["command_limits"], {
+                "exec_timeout_seconds": 120.0, "job_timeout_seconds": None, "task_slots": 1})
         await asyncio.gather(*(sequence(name) for name in self.ids))
         self.assertEqual(self.arrived, set(self.ids))
         self.assertEqual(guides["alpha"], guides["beta"])
@@ -188,17 +187,11 @@ control_plane_uid = 1000
         wrong = await self.call(tokens["alpha"], "exec", {"command": "forbidden", "environment": "beta"})
         self.assertTrue(wrong["isError"])
         self.assertEqual(self.calls, before)
-        limits = await self.call(tokens["alpha"], "pond_limits")
-        self.assertFalse(limits.get("isError"), limits)
-        self.assertEqual(limits["structuredContent"], {
-            "exec_timeout_seconds": 120.0,
-            "job_timeout_seconds": None, "task_slots": 1,
-        })
         for tool, arguments in (
-            ("pond_limits", {"environment": "beta"}),
+            ("pond_bootstrap", {"environment": "beta"}),
             ("job_start", {"command": "forbidden", "environment": "beta"}),
             ("job_list", {"environment": "beta"}),
-            ("job_status", {"job_id": "0" * 32, "environment": "beta"}),
+            ("job_wait", {"job_ids": ["0" * 32], "wait_seconds": 0, "environment": "beta"}),
             ("job_output", {"job_id": "0" * 32, "environment": "beta"}),
             ("job_stop", {"job_id": "0" * 32, "environment": "beta"}),
         ):
@@ -250,7 +243,7 @@ control_plane_uid = 1000
 
     async def test_expected_exec_deadlines_survive_public_boundary(self):
         from boring_worker_kit.execution import ForegroundAdmissionTimeout, ForegroundInterrupted
-        from boring_crocodile.outcomes import Refusal
+        from boring_crocodile.outcomes import Refused
         token = (await self.tokens("alpha")).access_token
         # Never started: a refusal with its code.
         self.assertEqual(ForegroundAdmissionTimeout().code, "not_admitted")
@@ -262,15 +255,15 @@ control_plane_uid = 1000
         self.assertEqual(refusal["code"], "not_admitted")
         self.assertIn("command not started", refusal["message"])
         # Started, then past the deadline: a failure, never a refusal.
-        self.assertNotIsInstance(ForegroundInterrupted(), Refusal)
+        self.assertNotIsInstance(ForegroundInterrupted(), Refused)
         self.assertIn("command may have started", ForegroundInterrupted().message)
         response = await self.call(token, "exec", {"command": "probe-interrupted"})
         self.assertTrue(response["isError"], response)
         text = response["content"][0]["text"]
         failure = json.loads(text)
         self.assertEqual(response["structuredContent"], failure)
-        self.assertNotIn("code", failure)
-        self.assertIn("command may have started", failure["failure"])
+        self.assertEqual(failure["code"], "foreground_interrupted")
+        self.assertIn("command may have started", failure["message"])
 
     async def test_control_plane_refusals_are_coded_json(self):
         token = (await self.tokens("alpha")).access_token
@@ -369,7 +362,7 @@ control_plane_uid = 1000
             "arguments": {"root": "work", "path": "note", "environment": "beta"}}]}
         self.assertTrue((await self.call(alpha, "batch", extra)).get("isError"))
 
-    async def test_profile_schema_and_credential_identity(self):
+    async def test_bootstrap_schema_and_credential_identity(self):
         issued = await self.tokens("alpha")
         response = await self.http.post("/mcp/alpha", headers={
             "Authorization": "Bearer " + issued.access_token,
@@ -380,15 +373,15 @@ control_plane_uid = 1000
         tools = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
         self.assertIn("selected context welcome", tools["pond_bootstrap"]["description"])
         self.assertNotIn("The Crocodile is ready", tools["pond_bootstrap"]["description"])
-        profile = tools["pond_profile"]
-        self.assertEqual(profile["_meta"], {"openai/profile": True})
-        self.assertEqual(profile["inputSchema"].get("properties"), {})
-        self.assertTrue(profile["annotations"]["readOnlyHint"])
-        self.assertFalse(profile["outputSchema"]["additionalProperties"])
-        self.assertEqual(set(profile["outputSchema"]["properties"]), {"id", "name"})
+        for retired in ("pond_profile", "pond_ping", "pond_limits", "job_status"):
+            self.assertNotIn(retired, tools)
+        self.assertTrue(tools["pond_bootstrap"]["annotations"]["readOnlyHint"])
         for name in self.ids:
-            result = await self.call((await self.tokens(name)).access_token, "pond_profile")
-            self.assertEqual(result["structuredContent"], {"id": self.ids[name], "name": name})
+            token = (await self.tokens(name)).access_token
+            self.assertEqual((await self.provider.load_access_token(token)).subject, self.ids[name])
+            result = await self.call(token, "pond_bootstrap")
+            self.assertEqual(result["structuredContent"]["handbook"]["documents"][0]["content"],
+                             name + " private context")
             self.assertEqual(json.loads(result["content"][0]["text"]), result["structuredContent"])
 
     async def test_approval_page_has_no_pond_picker_and_checks_the_pond_secret(self):
@@ -398,14 +391,14 @@ control_plane_uid = 1000
         self.assertIn("Pond: <strong>beta</strong>", page.text)
         for picker in ("<select", 'name="pond"', "Choose"):
             self.assertNotIn(picker, page.text)
-        self.assertNotIn("test-secret", page.text)
+        self.assertNotIn("test-secret-for-synthetic-tests", page.text)
         denied = await self.http.post("/approve", params={"request": request},
-                                      data={"secret": "alpha-test-secret"})
+                                      data={"secret": "alpha-test-secret-for-synthetic-tests"})
         self.assertEqual((denied.status_code, "Wrong approval secret." in denied.text), (403, True))
         approved = await self.http.post("/approve", params={"request": request},
-                                        data={"secret": "beta-test-secret"})
+                                        data={"secret": "beta-test-secret-for-synthetic-tests"})
         again = await self.http.post("/approve", params={"request": request},
-                                     data={"secret": "beta-test-secret"})
+                                     data={"secret": "beta-test-secret-for-synthetic-tests"})
         self.assertEqual(again.status_code, 400)
         self.assertIn("unknown or has expired", again.text)
         self.assertEqual(approved.status_code, 302)
@@ -444,7 +437,7 @@ control_plane_uid = 1000
         self.assertEqual(start.status_code, 302, start.text)
         request = parse_qs(urlparse(start.headers["location"]).query)["request"][0]
         approved = await self.http.post("/approve", params={"request": request},
-            data={"secret": "beta-test-secret"})
+            data={"secret": "beta-test-secret-for-synthetic-tests"})
         self.assertEqual(approved.status_code, 302, approved.text)
         callback = parse_qs(urlparse(approved.headers["location"]).query)
         self.assertEqual(callback["state"], ["test-state"])
@@ -455,8 +448,8 @@ control_plane_uid = 1000
         self.assertEqual(denied.status_code, 400)
         issued = await self.http.post("/token", data=data | {"code_verifier": verifier})
         self.assertEqual(issued.status_code, 200, issued.text)
-        result = await self.call(issued.json()["access_token"], "pond_profile", path="/mcp/beta")
-        self.assertEqual(result["structuredContent"]["id"], self.ids["beta"])
+        result = await self.call(issued.json()["access_token"], "pond_bootstrap", path="/mcp/beta")
+        self.assertEqual(result["structuredContent"]["handbook"]["documents"][0]["content"], "beta private context")
 
     async def test_discovered_resource_and_dynamic_client_http_flow(self):
         metadata = await self.http.get("/.well-known/oauth-protected-resource/mcp/alpha")
@@ -492,7 +485,7 @@ control_plane_uid = 1000
                     continue
                 request = parse_qs(urlparse(start.headers["location"]).query)["request"][0]
                 approved = await self.http.post("/approve", params={"request": request},
-                    data={"secret": "alpha-test-secret"})
+                    data={"secret": "alpha-test-secret-for-synthetic-tests"})
                 self.assertEqual(approved.status_code, 302)
                 code = parse_qs(urlparse(approved.headers["location"]).query)["code"][0]
                 issued = await self.http.post("/token", data={
@@ -501,8 +494,8 @@ control_plane_uid = 1000
                     "code": code, "code_verifier": verifier})
                 self.assertEqual(issued.status_code, 200)
                 token = issued.json()["access_token"]
-                result = await self.call(token, "pond_profile", path="/mcp/alpha")
-                self.assertEqual(result["structuredContent"]["id"], self.ids["alpha"])
+                result = await self.call(token, "pond_bootstrap", path="/mcp/alpha")
+                self.assertEqual(result["structuredContent"]["handbook"]["documents"][0]["content"], "alpha private context")
 
     async def test_bare_mcp_is_gone(self):
         # Not an endpoint: a plain 404 that points no client at any sign-in.
@@ -524,7 +517,7 @@ control_plane_uid = 1000
             state="state", scopes=["mcp"], code_challenge="test-challenge",
             redirect_uri=AnyUrl("https://client.test/callback"),
             redirect_uri_provided_explicitly=True, resource="https://server.test/mcp"))
-        callback = legacy.approve(parse_qs(urlparse(url).query)["request"][0], "alpha-test-secret", "alpha")
+        callback = legacy.approve(parse_qs(urlparse(url).query)["request"][0], "alpha-test-secret-for-synthetic-tests", "alpha")
         code = await legacy.load_authorization_code(self.client, parse_qs(urlparse(callback).query)["code"][0])
         token = (await legacy.exchange_authorization_code(self.client, code)).access_token
         for path, status in (("/mcp/alpha", 401), ("/mcp/beta", 401), ("/mcp", 404)):
@@ -545,8 +538,8 @@ control_plane_uid = 1000
 
     async def test_pond_path_token_works_only_on_its_path(self):
         token = (await self.tokens("alpha")).access_token
-        result = await self.call(token, "pond_profile", path="/mcp/alpha")
-        self.assertEqual(result["structuredContent"]["id"], self.ids["alpha"])
+        result = await self.call(token, "pond_bootstrap", path="/mcp/alpha")
+        self.assertEqual(result["structuredContent"]["handbook"]["documents"][0]["content"], "alpha private context")
         denied = await self.http.post("/mcp/beta", headers={"Authorization": "Bearer " + token},
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         self.assertEqual(denied.status_code, 401)
@@ -560,10 +553,10 @@ control_plane_uid = 1000
         self.assertIn("alpha", page.text)
         # The form cannot redirect the request to another Pond.
         denied = await self.http.post("/approve", params={"request": request},
-                                      data={"pond": "beta", "secret": "beta-test-secret"})
+                                      data={"pond": "beta", "secret": "beta-test-secret-for-synthetic-tests"})
         self.assertEqual(denied.status_code, 403)
         approved = await self.http.post("/approve", params={"request": request},
-                                        data={"pond": "beta", "secret": "alpha-test-secret"})
+                                        data={"pond": "beta", "secret": "alpha-test-secret-for-synthetic-tests"})
         self.assertEqual(approved.status_code, 302)
         code = parse_qs(urlparse(approved.headers["location"]).query)["code"][0]
         grant = await self.provider.load_authorization_code(self.client, code)

@@ -3,10 +3,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from boring_crocodile.settings import Settings, EnvironmentSettings, tomllib
-from unittest.mock import patch
+import tomllib
+from boring_crocodile.settings import Settings, EnvironmentSettings
+from boring_crocodile.site_adopt import legacy_settings
 
-from pond_config import one_pond_toml
+from pond_config import one_pond_toml, runtime_settings
 
 
 class SettingsTest(unittest.TestCase):
@@ -15,9 +16,14 @@ class SettingsTest(unittest.TestCase):
         config.write_text(one_pond_toml(Path(directory), environment))
         return config
 
+    def test_disk_loader_requires_declarations_and_explicit_adoption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "one-time adoption importer"):
+                Settings.load(self.config(directory))
+
     def test_loads_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            settings = Settings.load(self.config(directory))
+            settings = runtime_settings(self.config(directory))
             self.assertEqual(settings.environments["pond"].default_cwd, Path(directory))
             self.assertEqual(settings.ponds["pond"].context_root, Path(directory))
 
@@ -34,10 +40,10 @@ class SettingsTest(unittest.TestCase):
                           base + '[environments.pond.pirates.parrot]\nsocket_path = "/srv/parrot.sock"\n'):
                 config.write_text(stale)
                 with self.subTest(stale=stale), self.assertRaises(ValueError):
-                    Settings.load(config)
+                    runtime_settings(config)
             config.write_text(base[:base.index("[ponds.pond]")] + base[base.index("[environments.pond]"):])
             with self.assertRaisesRegex(ValueError, r"at least one \[ponds.<name>\]"):
-                Settings.load(config)
+                runtime_settings(config)
 
     def test_worker_kit_owns_the_execution_rules(self):
         # Defaults follow the environment's name; what breaks worker-kit's rules is refused.
@@ -46,7 +52,7 @@ class SettingsTest(unittest.TestCase):
             garden = config.read_text().replace('environment = "pond"', 'environment = "garden"') \
                 .replace("[environments.pond]", "[environments.garden]")
             config.write_text(garden)
-            environment = Settings.load(config).environments["garden"]
+            environment = runtime_settings(config).environments["garden"]
             self.assertEqual(environment.task_unit_prefix, "boring-crocodile-task-garden")
             self.assertEqual(environment.task_cgroup_parent, Path("/system.slice/system-crocodilegarden.slice"))
             outside = str(Path(directory).parent)
@@ -57,17 +63,17 @@ class SettingsTest(unittest.TestCase):
                 text = garden.replace(f'default_cwd = "{directory}"\n', "") if line.startswith("default_cwd") else garden
                 config.write_text(text + line + "\n")
                 with self.subTest(line=line), self.assertRaisesRegex(ValueError, message):
-                    Settings.load(config)
+                    runtime_settings(config)
 
     def test_loads_the_command_gate(self):
         with tempfile.TemporaryDirectory() as directory:
-            environment = Settings.load(self.config(directory, "command_execution_enabled = false\n")).environments["pond"]
+            environment = runtime_settings(self.config(directory, "command_execution_enabled = false\n")).environments["pond"]
             self.assertFalse(environment.command_execution_enabled)
 
     def test_files_toml_admission_with_commands_disabled(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            settings = Settings.load(self.config(directory, f"""command_execution_enabled = false
+            settings = runtime_settings(self.config(directory, f"""command_execution_enabled = false
 [environments.pond.files.roots.project]
 path = "{root}/project"
 read = true
@@ -93,28 +99,24 @@ max_file_bytes = 1024
             for field in ("max_parallel_tasks", "default_timeout_seconds", "max_timeout_seconds"):
                 config.write_text(base + f"{field} = 33\n")
                 with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
-                    Settings.load(config)
+                    runtime_settings(config)
 
     def test_explicit_context_configuration(self):
-        # The fresh-install reference, with hand-chosen files and a project.
-        reference = Path("site/default/etc/boring-crocodile/config.toml").read_text()
-        source = reference.replace('files = ["HANDBOOK.md", "WELCOME.md"]',
-                                   'files = ["CONTRACT.md", "BOUNDARIES.md"]', 1)
-        source += ('[ponds.pond.projects.example-project]\n'
-                   'files = ["example-project/README.md", "example-project/STATUS.md"]\n')
-        with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / "config.toml"
-            config.write_text(source)
-            pond = Settings.load(config).ponds["pond"]
-            self.assertEqual(pond.files[0], "CONTRACT.md")
-            self.assertEqual(pond.projects["example-project"],
-                             ("example-project/README.md", "example-project/STATUS.md"))
-            for invalid in ('files = []', 'files = ["../escape"]', 'files = ["a", "a"]', 'files = "a"'):
-                start = source.index("files = [")
-                end = source.index("]", start) + 1
-                config.write_text(source[:start] + invalid + source[end:])
-                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                    Settings.load(config)
+        from boring_crocodile.site_model import SiteDescription
+        site = SiteDescription.read(Path("site/default/etc/boring-crocodile/config.toml"))
+        ponds = {name: copy.deepcopy(p.document) for name,p in site.ponds.items()}
+        document = ponds["pond"]["pond"]
+        document["files"] = ["CONTRACT.md", "BOUNDARIES.md"]
+        document["projects"] = {"example-project": {
+            "files": ["example-project/README.md", "example-project/STATUS.md"]}}
+        pond = SiteDescription.parse(site.document, ponds).runtime_settings().ponds["pond"]
+        self.assertEqual(pond.files[0], "CONTRACT.md")
+        self.assertEqual(pond.projects["example-project"],
+                         ("example-project/README.md", "example-project/STATUS.md"))
+        for invalid in ([], ["../escape"], ["a", "a"], "a"):
+            document["files"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                SiteDescription.parse(site.document, ponds)
 
     def test_rejects_wrong_container_scalar_and_policy_key_types(self):
         base = dict(allowed_roots=["/intended"], socket_path="/tmp/worker.sock",
@@ -138,8 +140,7 @@ max_file_bytes = 1024
         self.assertNotIn(Path("/"), valid.allowed_roots)
 
     def test_config_sections_reject_unknown_keys_and_coercion(self):
-        path = Path("site/default/two-ponds/etc/boring-crocodile/config.toml")
-        base = tomllib.loads(path.read_text())
+        base = tomllib.loads(one_pond_toml(Path("/intended")))
         changes = (
             ("server", "bind_port", True), ("server", "bind_port", 8503.5),
             ("server", "bind_port", 65536), ("server", "bind_port", 0),
@@ -151,14 +152,12 @@ max_file_bytes = 1024
             data = copy.deepcopy(base)
             data[section][key] = value
             with self.subTest(section=section, key=key, value=value):
-                with patch("boring_crocodile.settings.tomllib.load", return_value=data):
-                    with self.assertRaises(ValueError):
-                        Settings.load(path)
+                with self.assertRaises(ValueError):
+                    legacy_settings(data)
         for section in ("environments", "ponds"):
             with self.subTest(section=section):
-                with patch("boring_crocodile.settings.tomllib.load", return_value=dict(base, **{section: []})):
-                    with self.assertRaises(ValueError):
-                        Settings.load(path)
+                with self.assertRaises(ValueError):
+                    legacy_settings(dict(base, **{section: []}))
 
 
 class TaskStartTest(unittest.TestCase):

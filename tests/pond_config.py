@@ -1,7 +1,14 @@
-"""The smallest config Settings accepts: one Pond named pond, rooted at root."""
+"""Composed runtime-view fixtures; disk-loader tests use typed site declarations."""
 from pathlib import Path
 
 PROFILE_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def runtime_settings(path: Path):
+    """Validate a unit-test runtime view, not an installed-site file."""
+    import tomllib
+    from boring_crocodile.site_adopt import legacy_settings
+    return legacy_settings(tomllib.loads(path.read_text()))
 
 
 def dynamic():

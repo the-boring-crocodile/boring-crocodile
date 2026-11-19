@@ -1,10 +1,41 @@
 [Unit]
 PartOf=boring-crocodile-mcp.target
-Description=Boring Crocodile shared pond command budget
+Description=Boring Crocodile shared pond worker and command budget
 [Slice]
 MemoryAccounting=yes
 TasksAccounting=yes
 MemoryMax=2147483648
 MemorySwapMax=0
 TasksMax=256
+SocketBindDeny=tcp:8503
+SocketBindDeny=tcp:18510
+SocketBindDeny=tcp:18511
+SocketBindDeny=tcp:18512
+SocketBindDeny=tcp:18513
+SocketBindDeny=tcp:18514
+SocketBindDeny=tcp:18515
+SocketBindDeny=tcp:18516
+SocketBindDeny=tcp:18517
+SocketBindDeny=tcp:18518
+SocketBindDeny=tcp:18519
+SocketBindDeny=tcp:18520
+SocketBindDeny=tcp:18521
+SocketBindDeny=tcp:18522
+SocketBindDeny=tcp:18523
+SocketBindDeny=tcp:18524
+SocketBindDeny=tcp:18525
+SocketBindDeny=tcp:18526
+SocketBindDeny=tcp:18527
+SocketBindDeny=tcp:18528
+SocketBindDeny=tcp:18529
+SocketBindDeny=tcp:18530
+SocketBindDeny=tcp:18531
+SocketBindDeny=tcp:18532
+SocketBindDeny=tcp:18533
+SocketBindDeny=tcp:18534
+SocketBindDeny=tcp:18535
+SocketBindDeny=tcp:18536
+SocketBindDeny=tcp:18537
+SocketBindDeny=tcp:18538
+SocketBindDeny=tcp:18539
 # No CPUQuota or MemoryHigh: emergency ceilings, no routine throttling.

@@ -1,0 +1,32 @@
+enabled = true
+credential_file = "/etc/boring-crocodile/credentials/approval-secret"
+
+[identity]
+name = "boring-crocodile"
+uid = 901
+group = "boring-crocodile"
+gid = 901
+home = "/home/boring-crocodile"
+shell = "/usr/sbin/nologin"
+
+[limits]
+memory_bytes = 2147483648
+swap_bytes = 0
+tasks_max = 256
+task_tasks_max = 128
+
+[pond]
+profile_id = "00000000-0000-4000-8000-000000000001"
+display_name = "The Pond"
+files = ["HANDBOOK.md", "WELCOME.md", "OPERATING_TOGETHER.md"]
+welcome_file = "WELCOME.md"
+
+[execution]
+
+[execution.files]
+
+[execution.files.roots]
+
+[execution.files.roots.home]
+read = true
+write = true

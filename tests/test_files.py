@@ -218,13 +218,13 @@ class FileBoundaryTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_expected_errors_have_stable_raw_and_public_codes(self):
         raw = await self.raw({"operation": "file_read", "root": "work", "path": "missing"})
-        self.assertEqual(raw, {"ok": False, "refusal": {"code": "not_found", "message": "file does not exist"}})
+        self.assertEqual(raw, {"ok": False, "refusal": {"status": "refused", "code": "not_found", "message": "file does not exist"}})
         with self.assertRaises(RefusalError) as caught:
             await self.call('file_read', path='missing')
         self.assertIsInstance(caught.exception, ToolError)
         # The public text is the refusal itself, as JSON data.
         self.assertEqual(json.loads(str(caught.exception)),
-                         {"code": "not_found", "message": "file does not exist"})
+                         {"status": "refused", "code": "not_found", "message": "file does not exist"})
         await self.refused('not_found', 'file_list', path='nowhere')
         created = await self.call('file_write', path='nested/version', content='a', expected_sha256=None)
         await self.refused('stale', 'file_write', path='nested/version', content='b', expected_sha256='0'*64)

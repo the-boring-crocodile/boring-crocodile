@@ -17,7 +17,7 @@ from pydantic import Field, ValidationError
 from boring_worker_kit.batch_contracts import (BATCH_INPUT_BYTES, BATCH_MAX_STEPS, Arguments, BatchRequest,
                                                BatchStep, StepBase, invalid_request)
 from boring_worker_kit.framing import MAX_FRAME_BYTES
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 
 
 class SaveTo(Arguments):
@@ -49,7 +49,7 @@ class PondBatchRequest(BatchRequest):
 def admit(raw: object) -> PondBatchRequest:
     """The kit's admission (input size, step shapes, unique IDs) with service_call added."""
     if len(json.dumps(raw, ensure_ascii=True, allow_nan=False).encode()) > min(BATCH_INPUT_BYTES, MAX_FRAME_BYTES):
-        raise Refusal("limit", "batch input exceeds limit")
+        raise Refused("limit", "batch input exceeds limit")
     try:
         return PondBatchRequest.model_validate(raw)
     except ValidationError as error:

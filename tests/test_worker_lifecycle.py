@@ -14,7 +14,7 @@ from boring_crocodile.handbook_context import ContextBootstrap
 from boring_worker_kit.execution import EnvironmentExecutor
 from boring_worker_kit.host_limits import HostLimits
 from boring_crocodile.settings import EnvironmentSettings
-from boring_crocodile.outcomes import Refusal, RefusalError
+from boring_crocodile.outcomes import Refused, RefusalError
 from boring_crocodile.worker import WorkerServer
 from boring_crocodile.worker_client import WorkerClient
 
@@ -257,14 +257,14 @@ print(json.dumps(dict(n={n},start=a,end=time.monotonic())))
 
     async def test_invalid_timeout_fails_without_launch(self):
         for value in (float('nan'),float('inf')):
-            with self.assertRaisesRegex(Refusal,'finite'):
+            with self.assertRaisesRegex(Refused,'finite'):
                 await self.worker.executor.execute('true',None,value)
 
 
 class DescendantTest(unittest.TestCase):
     # The probe watches its fixture through a pidfd. Distribution Pythons on
     # Linux have os.pidfd_open; portable builds compiled against old kernel
-    # headers (uv's python-build-standalone 3.10) do not.
+    # headers may not.
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "this Python lacks os.pidfd_open")
     def test_cleanup_probe_has_no_surviving_children(self):
         # Separate subreaper process keeps fixture adoption out of the test runner.

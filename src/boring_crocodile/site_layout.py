@@ -2,9 +2,8 @@
 lock every change to the site takes and how its files are written.
 
 The one owner of these defaults: setup, rendering, activation, uninstall and
-admin import them instead of spelling them out. The first Pond is the one
-created by the initial setup; it owns the site, and its artifacts keep the
-unprefixed names.
+admin import them instead of spelling them out. The initial Pond keeps
+the historical unprefixed artifact names.
 """
 from __future__ import annotations
 
@@ -13,20 +12,23 @@ import contextlib
 import fcntl
 import os
 from pathlib import Path
+import re
 import stat
-
-from boring_file_core import atomic_write
 
 STATE_DIR = Path("/etc/boring-crocodile")
 CONFIG_FILE = STATE_DIR / "config.toml"
 CREDENTIALS_DIR = STATE_DIR / "credentials"
 OAUTH_DATABASE = Path("/var/lib/boring-crocodile/oauth.sqlite3")
-SITE_RECORDS = Path("/var/lib/boring-crocodile-site")
-"""Root's own records of changes to a running site: site-log.jsonl and
-site-backups/. Not /var/lib/boring-crocodile, which belongs to the controller:
-root never writes where an unprivileged account could plant a link."""
 CONTROL_CREDENTIALS = Path("/run/credentials/boring-crocodile-mcp.service")
 INITIAL_POND = "pond"
+REGISTRATION_GROUP = "pond-pirates"
+REGISTRATION_ROOT = Path("/run/boring-crocodile/guests")
+
+
+def registration_path(environment: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", environment):
+        raise ValueError("invalid registration environment")
+    return REGISTRATION_ROOT / environment / "register.sock"
 
 
 def approval_credential(pond: str) -> str:
@@ -70,6 +72,7 @@ def write_file(path: Path, content: str | bytes, *, mode: int | None = None, cre
     mode and group, so config.toml keeps one mode whichever command writes it.
     Keeping needs an existing regular file of the writer (root on a host).
     """
+    from boring_file_core import atomic_write
     payload = content.encode() if isinstance(content, str) else content
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
@@ -87,39 +90,41 @@ def write_file(path: Path, content: str | bytes, *, mode: int | None = None, cre
 SITE_LOCK = "site.lock"
 
 
+def description_modes(site, config: Path, *, owner: int = 0, credential_path=Path) -> list[dict]:
+    """The standard description's only owner/group/mode table."""
+    state = config.parent
+    rows = []
+    def add(path, directory, gid, mode):
+        rows.append(dict(path=str(path), directory=directory, uid=owner, gid=gid, mode=mode))
+    add(state, True, 0, 0o711)
+    add(config, False, 0, 0o644)
+    add(state / "ponds", True, site.controller.gid, 0o751)
+    for name, pond in site.ponds.items():
+        folder = state / "ponds" / name
+        retired = site.state == "removed"
+        add(folder, True, 0 if retired else pond.identity.gid, 0o700 if retired else 0o750)
+        add(folder / "config.toml", False, 0 if retired else pond.identity.gid, 0o600 if retired else 0o640)
+    credentials = state / "credentials"
+    if credentials.exists():
+        add(credentials, True, 0, 0o700)
+    for pond in site.ponds.values():
+        secret = credential_path(pond.credential_file)
+        if os.path.lexists(secret):
+            add(secret, False, 0, 0o600)
+            rows[-1]["credential"] = True
+    add(state / SITE_LOCK, False, 0, 0o600)
+    return rows
+
+
+
 class SiteLocked(ValueError):
     """Another change to the site holds the site lock."""
 
 
-def records_dir(path: Path = SITE_RECORDS, *, owner: int = 0) -> Path:
-    """`path`, created if missing, after checking it is a real folder of
-    `owner` (root on a host) that nobody else can write. Refuses otherwise."""
-    with contextlib.suppress(FileExistsError):
-        os.mkdir(path, 0o700)
-    info = os.lstat(path)
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != owner or info.st_mode & 0o022:
-        raise ValueError(f"Unsafe records folder (must be a folder of uid {owner}, "
-                         f"writable by it only): {path}")
-    return path
-
-
-def append_record(line: str, path: Path = SITE_RECORDS, *, owner: int = 0) -> None:
-    """One line appended to site-log.jsonl in the records folder, never through a link."""
-    folder = records_dir(path, owner=owner)
-    fd = os.open(folder / "site-log.jsonl",
-                 os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-    with os.fdopen(fd, "a") as log:
-        info = os.fstat(log.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != owner or info.st_nlink != 1:
-            raise ValueError("Unsafe site log: " + str(folder / "site-log.jsonl"))
-        log.write(line + "\n")
-
-
 @contextlib.contextmanager
 def site_lock(state: Path = STATE_DIR, *, owner: int = 0) -> Iterator[None]:
-    """One change to the site at a time: setup and --add-pond apply, site
-    activation, --site-extend, uninstall, pirate-add/remove and task-policy
-    apply all hold this lock (STATE/site.lock) while they change the site.
+    """One change to the site at a time: render, provisioning, retirement,
+    service-policy changes hold this lock (STATE/site.lock).
 
     It does not wait: a second change refuses (SiteLocked) and changes nothing.
     flock belongs to the open file, so a second site_lock in the same process

@@ -1,286 +1,415 @@
 # Operating a site
 
-Updating, configuring, backing up and removing a running Crocodile site.
-Installing one: [INSTALL](INSTALL.md). How deploy, update and rollback work in
-general: [boring-deploy](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/packages/boring-deploy/README.md).
-The admin command: [ADMIN](ADMIN.md).
+Installing a new site: [INSTALL](INSTALL.md). Administrative commands:
+[ADMIN](ADMIN.md). Runtime deployment:
+[boring-deploy](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/packages/boring-deploy/README.md).
 
-Go straight to [updating](#updating), [starting and stopping](#starting-and-stopping),
-[configuration](#changing-configuration), [backup and restore](#backup-and-restore),
-[secret replacement](#replacing-an-approval-secret), [removal](#uninstalling),
-or [an interrupted site change](#when-a-site-change-stops-part-way).
+## The description and the render
 
-## Where things are
+Two kinds of files describe the site:
 
-| Path | What |
+| Path | What it owns |
 |---|---|
-| `/opt/boring-crocodile/current`, `previous`, `releases/` | The runtime (a standalone Python with the locked wheels), switched by the deploy |
-| `/opt/boring-crocodile/DEPLOYED` | One line per deploy |
-| `/etc/boring-crocodile/config.toml` | The site configuration |
-| `/etc/boring-crocodile/credentials/` | Approval secrets, 0600, root |
-| `/etc/boring-crocodile/ponds/NAME/`, `*.json` receipts | What setup created |
-| `/var/lib/boring-crocodile/oauth.sqlite3` | Sign-ins, grants, registered services ([OAUTH](OAUTH.md)) |
-| `/var/lib/boring-crocodile-site/` | Root's own records: `site-backups/` (files replaced by `--site-extend`, `--site-render`, `pirate-add`) and `site-log.jsonl`; kept by uninstall |
-| `/run/boring-crocodile/` | Worker and task sockets; `guests/POND/register.sock` for Pirates |
-| `POND-HOME/.boring-crocodile/jobs.sqlite3` | The Pond's job records |
+| `/etc/boring-crocodile/config.toml` | Site state, runtime path, controller identity, listener and Pirate admission |
+| `/etc/boring-crocodile/ponds/NAME/config.toml` | Pond enablement, Unix identity binding, UUID, context, file roots, execution settings, explicit ceilings and credential path |
+| `/etc/boring-crocodile/credentials/` | Approval secrets, private root files; contents are not configuration |
+| `/var/lib/boring-crocodile/oauth.sqlite3` | Sign-ins, grants and service policy ([OAUTH](OAUTH.md)) |
+| `DEFAULT-CWD/.boring-crocodile/jobs.sqlite3` | The Pond's job records |
 
-The deploy writes only under `/opt/boring-crocodile`; everything in `/etc`,
-`/var/lib` and the homes belongs to the site.
+The main file's `[site].state` is `running`, `stopped` or `removed`.
+A per-Pond `enabled = false` parks that Pond. Numeric UID/GID bindings,
+UUIDs, ceilings and paths are explicit; render refuses changed or missing
+identities rather than adopting another account with the same name.
+
+Render derives the root-owned base units, task policy and tmpfiles from this
+description. It reconciles the declared Unix access groups and runs the
+systemd tail. It restores ordinary owner/group modes on the description:
+
+| Path below `/etc/boring-crocodile` | Owner:group | Mode |
+|---|---|---|
+| the directory | root:root | 0711 |
+| `config.toml` | root:root | 0644 |
+| `ponds/` | root:controller-group | 0751 |
+| `ponds/NAME/` | root:Pond-group | 0750 |
+| `ponds/NAME/config.toml` | root:Pond-group | 0640 |
+| `credentials/`, secret files | root:root | 0700, 0600 |
+| `site.lock` | root:root | 0600 |
+
+Workers/task runners read the main file and their own declaration. The controller
+unit names its enabled Ponds and supplies their supplementary groups; it opens
+exactly those files. Root administration reads parked/sealed declarations.
+Render removes stale access/default ACLs from managed description paths without
+an ACL-tool dependency. Old private receipts and unrelated entries are untouched;
+unsafe siblings require review. `site-check` reports owner/group/mode or ACL drift.
+It never creates accounts, replaces secrets or deletes data.
+Explicit setup provisions accounts, UUIDs and missing secrets; explicit
+`uninstall --delete-data` retires them.
+
+All planned changes preview without effects. With `--apply`, review the fresh
+plan and type `APPLY` at the terminal. The shared
+`/etc/boring-crocodile/site.lock` excludes concurrent site changes; a changed
+description, host fact or policy makes the reviewed plan stale. No digest
+needs to be copied and there is no `--resume`, receipt or activation record.
+
+## Rendering and repairing
+
+Finish or stop active work before an apply: restarting workers interrupts
+their running jobs and client connections. Interrupted work is never replayed.
+
+    sudo boring-crocodile-setup --site-render
+    sudo boring-crocodile-setup --site-render --apply
+
+The plan includes configuration and generated-file diffs, group changes,
+units to stop and the systemd tail. Even with no file differences, every
+render reloads systemd. For a running site it starts the wanted slices and
+task sockets, restarts enabled workers, starts the listener/target and
+restarts the controller. It then waits for local readiness for up to a minute.
+The controller and enabled workers must remain active with unchanged positive
+main PIDs for at least ten seconds; inactivity or a restarted process resets
+the interval. A passing observation between restarts is insufficient.
+Rerunning therefore repairs a failed tail even when the saved files match.
+
+The root TCP listener stays open for ordinary renders and controller
+restarts. It stops when its unit/listen address or an existing slice's
+protected ports change, and when the desired site is stopped or removed.
+Those transitions stop the affected work before the change. Review the stop
+list and allow an interruption. Render does not perform a complete site
+stop/start for every change.
+
+Pirate reception folders/sockets are prepared before workers start.
+Admission and worker client groups are reconciled before startup; service
+grants requested by `--site-extend` are saved before enabling the Pond.
+Workers start before the controller's final restart. Local readiness does
+not prove external registration: Pirates and services reconnect
+asynchronously. Check them from the intended Pond and test the client path.
+
+A stopped site keeps its generated files and starts nothing. A removed site
+has no generated integration. Neither state deletes its configuration,
+accounts, credentials, homes or database.
+
+### External drop-ins
+
+Render accepts every root-owned external drop-in and shows its complete
+contents verbatim in the reviewed plan. Put secrets in files referenced by
+`LoadCredential=` and keep their contents out of drop-ins. Settings also
+present in the generated unit
+carry warnings; systemd owns precedence and syntax. Render never rewrites or
+deletes these files. Symlinks, masks and unsafe ownership or modes are refused;
+there is no directive allow-list.
+
+Task authority is declared by the Pond file's `[execution].no_new_privileges`
+and generated base task unit; see [PERMISSIONS](PERMISSIONS.md).
+Site-check and status use the same effective task-policy comparison. A loaded
+mismatch is irregular/degraded, including a drop-in's `NoNewPrivileges=no`
+over a restricted declaration. A warning in the render plan does not itself
+prove what systemd loaded.
+
+Base units are generated: an approved render replaces edits to them.
+Keep a separate backup before deliberate edits; render creates no backup
+journal. Inspect the fresh plan rather than inferring success from file
+equality.
 
 ## Updating
 
-Finish or stop active work first: an update restarts running components,
-interrupting commands and client connections. It does not replay interrupted
-jobs. A code update and a change to the site's systemd units are separate
-operations, so you can review host-policy changes instead of inheriting them
-silently with a new runtime.
-
-### Replace the runtime
-
-From a trusted, unpacked release (see [INSTALL](INSTALL.md#1-deploy-the-runtime)):
+The runtime lives under `/opt/boring-crocodile`: `releases/`, `current`,
+`previous` and `DEPLOYED`. Site files and homes are independent of it.
+From a trusted unpacked release (download:
+[INSTALL](INSTALL.md#1-deploy-the-runtime)):
 
     sudo boring-crocodile-VERSION/deploy --check
     sudo boring-crocodile-VERSION/deploy
 
-`--check` is read-only: it verifies the release and the host and writes
-nothing. The deploy itself then runs the Crocodile's check, `admin list` from
-the new release against the site, before the switch; its smoke is `admin
-status`: every check that passed before the switch must pass after it, and
-the controller must run whatever it did before (a check that already failed
-is reported, not fatal). The deploy backs up the OAuth store when its schema
-changes and restarts the site's controller and worker services that are
-running: a short outage. The controller first waits up to 90 seconds for open
-connections to close, so the switch can sit quiet that long; clients
-reconnect afterwards. Running commands end (systemd cleans up their cgroups);
-their jobs are listed as `interrupted`; nothing replays them. A stopped site stays stopped: the deploy says `site is stopped: not
-started` and skips start and smoke. On a host without `config.toml` the
-restart, check and smoke are skipped. A deploy holds the site lock, so it
-and a site change (setup, `--site-extend`, `pirate-add`, ...) refuse each
-other rather than overlap.
+`--check` verifies without writing. Deploy never opens Pond-owned receipt
+databases as root. Each worker opens its own store and accepts only schema 1
+with the current receipt columns; it creates an absent store itself.
+An unsupported or unreadable store disables only that Pond's managed jobs.
+Bootstrap reports `managed_jobs_error`, job calls refuse with `unavailable`,
+and the worker logs the cause. Files, foreground commands and services stay
+available; the bad store cannot veto the site's runtime update.
 
-### Review site-file changes
+To restore jobs, stop that worker, preserve a consistent private archive,
+then explicitly repair or move the store and restart the worker. Include any
+WAL or rollback journal in the recovery; do not discard pending writes.
+The worker never converts an old receipt schema or silently retries storage
+initialization.
 
-A deploy does not change rendered site files (units, tmpfiles, `config.toml`
-sections). When a release renders them differently, its check says so, and
-`site-check` reports each file as differing from the template. Preview those
-changes as root:
+Deploy validates the candidate against
+the configuration, holds the site lock, switches the runtime and restarts
+running components. It can wait up to 90 seconds for controller connections
+to close. Clients reconnect; interrupted commands do not replay. A stopped
+site remains stopped. Before a schema change, deploy backs up the OAuth
+store; normal smoke compares local status before and after. If the installed
+reader cannot parse the live description, deploy logs its reason and records
+the before-state as unknown. Smoke then requires every new-release status
+check to pass, including a running controller. Other status failures still
+stop the deploy. A stopped installation is checked when it next starts.
 
-    sudo boring-crocodile-setup --site-render
+Deploy does not render host policy. Review and apply `--site-render` after
+the runtime update when generated files change. A render is also the repair
+operation if startup failed after the switch.
 
-The preview shows a diff per file and a digest. After reviewing it, apply that
-plan:
+### Adopting a pre-description site
 
-    sudo boring-crocodile-setup --site-render --apply --approve-digest DIGEST
+The importer handles the standard published 0.4.21 single-file description.
+Normal deploy refuses that format. The family's
+[update guide](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/updating.md#choose-the-configuration-path-first)
+owns the component order and the decision between normal update and adoption.
+Use one maintenance window; keep Pirate work stopped until the compatible pair
+is checked. The description importer leaves the OAuth store to its owner:
+normal controller startup [upgrades schema 5 to 6](OAUTH.md#schema-and-backup)
+transactionally. Existing callers become readers until the reviewed service
+grant commands restore any intended writers.
 
-Apply backs up the files it replaces under
-`/var/lib/boring-crocodile-site/site-backups/`, writes them, reloads systemd,
-restarts what runs (the controller and workers, changed task sockets; running
-jobs are interrupted) and runs site-check again. Any other irregular finding
-stops it. Drop-ins are never touched: keep local changes there, since a hand
-edit of a base unit shows up as a diff and is replaced once the plan is
-approved. Drop-ins may set only the directives site-check knows (write paths,
-limits, groups, runtime caps, umask, ...); anything else, such as extra
-hardening (`IPAddressDeny=`, `Protect...=`) or `ExecStartPre=`, makes
-site-check irregular and stops this command and `--site-extend`. A masked or
-linked unit is refused, not unmasked. On a stopped site the files are written
-and nothing starts. Apply records controller activity before writing; a controller that was active
-must remain active and pass settled health afterward. A failed restart reports
-`rendered_but_degraded`, rather than treating the site as already stopped. An unreadable or
-transitional pre-change state stops before writing; an unreadable post-change state reports
-`local_health: unknown` with `activity_error` and recovery guidance.
-`--guests POND[,POND]` lets running Ponds accept guests (Pirates) in
-the same step: their config.toml line, the worker's write path and the
-registration folder.
+Keep the old artifact, its hash and a private matching snapshot before
+conversion. The importer preserves user identities, UUIDs, credentials,
+explicit limits and OAuth state for the normal startup upgrade. It rejects unsupported
+layouts. It plans a missing `pond-pirates` group and creates it only on
+stopped APPLY; existing groups are retained.
 
-### Roll back a runtime
+1. **Prove the candidate.** From the verified, root-protected artifact, run
+   `adopt-site.py --dry-run` with the installed runtime's Python 3.12+.
+   Require every account and `deploy_check` to report ok, and cleanup done.
+   This stages a private temporary description and offline runtime under
+   `/opt`, loads it as the actual controller and worker identities, and
+   runs the packaged check hook. It changes no live description, group,
+   store, runtime link or unit activity.
+2. **Finish work and stop consumers.** Record the actual loaded units and
+   which are active, including task instances, workers, controller, target
+   and sockets, plus Pirate services, task sockets and task instances. Stop and
+   verify them. Published 0.4.21 has no
+   `boring-crocodile-mcp.socket`: do not put a confirmed absent unit into
+   an all-or-nothing stop command.
+3. **Take the stopped snapshot.** Preserve the complete description and
+   credentials, generated units/drop-ins, slices, tmpfiles and enablement
+   links, OAuth state and affected private receipt directories. Preserve
+   numeric ownership, modes, ACLs and xattrs. Record each account's UID/GID
+   and supplementary groups, the active-unit list, paths and existing
+   shared role groups. Keep this root-only. Copying a live SQLite file is
+   not a consistent backup.
+4. **Convert while stopped.** Run the artifact's `adopt-site.py --apply`
+   with that Python, review the plan and type APPLY. It publishes the typed
+   description with state stopped. The old runtime cannot read those files;
+   do not start it. The controller's normal startup transaction performs
+   the store upgrade; no separate converter or schema-number edit is needed.
+5. **Preflight and deploy the candidate.** Run its `deploy --check`.
+   Deploy after refusals are resolved. A stopped site remains stopped. Receipt
+   stores belong to the workers; deploy never opens them as root. An unreadable
+   or unsupported store disables that Pond's managed jobs and reports the cause
+   after startup, while its other tools remain available. Preserve the old store
+   before an explicit repair or replacement; do not edit its schema number.
+6. **Render and verify.** Set `site.state` to running in the root-owned
+   main description, preview and APPLY the common render. Require regular
+   site-check, healthy status and a command through each enabled Pond.
+   After adoption, run the pirate-add commands printed by the Pirates check,
+   confirm their plans with --apply, then remove legacy client_uids and retry.
+   After adoption, run each service-grants preview printed by the Services
+   check. Review the complete caller map, run the printed `--apply` command
+   and type `APPLY`. Decide any custom author aliases before resuming
+   services. Verify an intended reader's read and an intended writer's
+   harmless write.
+   Complete the matching Pirate update before releasing Pirate work. The
+   Crocodile checks Pirate versions at registration. Check a fresh client and
+   Pirate registration before releasing the window.
 
-Use the previous release's deploy, `sudo /opt/boring-crocodile/previous/deploy`.
-This switches the code back; it does not undo work the AI did or restore the
-OAuth database. Check the release's data compatibility before going back
-([backup and restore](#backup-and-restore)).
+A failed step stops the operation. Inspect saved state before retrying.
+For a declared site, the common render is the repair operation; it does not
+reverse adoption.
 
-A rollback out of a restart loop can find the units and task sockets at
-systemd's start limit: `sudo systemctl reset-failed 'boring-crocodile*'`,
-then the rollback again.
+#### Way back across adoption
 
-## Starting and stopping
+Restore the matching legacy files as well as the old runtime. The following
+sequence was exercised with a two-Pond 0.4.21 site:
 
-The site is one systemd target; it starts the controller, the workers, the
-task sockets and the slices, and stopping it stops running work:
+1. Stop all actual candidate consumers and tasks. Preserve the candidate
+   description, state and receipt directories privately before replacing
+   them. Keep both snapshots.
+2. Identify generated files and enablement links absent from the original
+   snapshot. Move only those candidate additions aside; in particular, the
+   new root-held MCP socket must not remain in the old deployment. Preserve
+   unrelated administrator files.
+3. With all consumers stopped, move the converted description out of its
+   live path. Run the retained old artifact's deploy with no site config
+   present; this installs its runtime without asking the old reader to
+   parse converted files. Verify the old runtime is selected before restore.
+4. Restore the consistent legacy description, credentials, state, generated
+   integration and private receipts, including numeric owners, modes, ACLs
+   and xattrs. Restore the recorded supplementary memberships: the old
+   controller relied on NSS membership, while the new unit uses explicit
+   SupplementaryGroups. Keep the same UID/GID bindings.
+5. If adoption created a previously absent shared group, remove it only
+   after confirming it has no supplementary or primary users. Never delete
+   a pre-existing shared group. Compare restored files with the snapshot
+   before starting services.
+6. Daemon-reload and start the saved old active-unit set, without a socket
+   that did not exist there. If systemd explicitly reports a start-limit
+   failure during this recovery, reset those failed units before retrying.
+   Check the old version, site-check and a command through each restored
+   Pond, then its clients and compatible Pirates.
 
-    sudo systemctl enable --now boring-crocodile-mcp.target
-    sudo systemctl disable --now boring-crocodile-mcp.target   # stays off across updates
+Restoring OAuth state can restore old grants too; inspect the restored
+authority before opening the site to work. This is a maintenance operation,
+not an automatic response to every deployment refusal.
+
+### Rolling back a runtime
+
+Use the previous release's deploy:
+
+    sudo /opt/boring-crocodile/previous/deploy
+
+Check data and configuration compatibility first. A code rollback does not
+undo work or restore the OAuth database. In particular, rollback across
+adoption requires the saved legacy description while all consumers are
+stopped. If systemd's start limit blocks a reviewed recovery, reset failed
+Crocodile units before retrying.
 
 ## Changing configuration
 
-The controller and workers read `config.toml` once at start. After an edit,
-restart the affected worker and the controller together, so both see the same
-values (`daemon-reload` only for unit changes; it does not reload the
-config). Task runners read the config when they start. Handbook edits are read
-on every bootstrap, no restart.
+For a persistent stop, set `state = "stopped"` in the main file's `[site]`
+table, then preview/apply render. Set it to `"running"` and render to start
+again. Enabled Ponds retain their limits and settings. An emergency
+`systemctl stop boring-crocodile-mcp.target` changes activity only: the next
+render follows the saved desired state.
 
-A Pond's name as people see it (the sign-in page, `pond_ping`,
-`pond_profile`) is `display_name` in its `[ponds.NAME]` table; change it
-there and restart the controller (`systemctl restart
-boring-crocodile-mcp.service`). site-check judges `config.toml` by its
-values, so the edit keeps the site regular.
+Edit the appropriate description, then preview/apply render. Runtime
+processes read configuration at startup; handbook files are read on each
+bootstrap. The sign-in name is `display_name` under `[pond]` in that
+Pond's file. It also names the worker in runtime results. Preserve its
+`profile_id` and identity binding; there is no second execution display name.
 
-Removed fields (`default_timeout_seconds`, `max_timeout_seconds`,
-`max_parallel_tasks` in an environment) are refused, not ignored. Time limits:
-[TOOLS](TOOLS.md#jobs-and-time-limits).
+The identity's `home` supplies these defaults. Omit a key when using its default:
+
+| Key | Derived value |
+|---|---|
+| `pond.context_root` | `<home>/handbook` |
+| `execution.default_cwd` | `<home>` |
+| `execution.allowed_roots` | `[<home>]` |
+| `execution.files.roots.home.path` | `<home>` (fixed; never written) |
+
+Custom context, working-directory and allowed-root overrides remain explicit.
+The home file root still declares its read/write rights and optional deny list;
+other named file roots declare their own paths. File limits stay explicit.
+An absent file policy still disables file tools.
+
+The reader rejects repeated default keys and `execution.display_name`, naming
+the exact key to remove. For a published 0.4.21 single-file site, use the
+[one-time adoption procedure](#adopting-a-pre-description-site); it preserves custom
+paths and policy, removes equal defaults and rejects conflicting display names
+or a home file-root alias that points elsewhere.
+
+`--site-config FILE` and `--site-wizard` configure the public listener and
+initial Pond policy and select running state. Use direct description edits
+and render when preserving an existing site's individual Pond policies.
+Every enabled Pond has Pirate reception. Provisioning creates the shared
+registration group and each private registration directory; workers bind their
+sockets on start. Admission remains explicit through `pirate-add`.
+
+`--site-extend --bring-back NAME` enables only the named Ponds, optionally
+changing their limits or granting existing SQLite services first. Without
+`--bring-back`, no Pond is selected for activation, limits or grants. The same
+explicit selection can repair an interrupted extension after its declarations
+were saved. Saved ceilings stay as declared unless an explicit flag changes them.
+Pirate admission uses the same render; service policy commands use the same
+plan/APPLY and lock, but write SQLite without rendering
+or restarting the site ([ADMIN](ADMIN.md)).
 
 ## Backup and restore
 
-The release can replace the software; it cannot recreate a Pond's work or
-remember who was allowed in. Back up those separately. In particular, use the
-OAuth backup command below for a consistent copy of the live database.
+Back up each Pond's home, the complete `/etc/boring-crocodile` description
+and secrets, the OAuth store, and each service/Pirate's own state.
+Use `boring-crocodile-admin oauth backup --output FILE` for a consistent
+live database copy in a private root-owned directory. It contains bearer
+tokens. Preserve numeric account/group bindings with the host backup.
 
-What to back up, most important first:
+To restore on the same host, stop every Crocodile consumer, retain the
+current files for recovery, restore the matching description/secrets/homes
+and database, verify ownership and identities, then render the desired
+state. The store belongs to the controller, mode 0600. Run
+`admin site-check`, `admin status --check` and a client journey.
+A render cannot reconstruct missing accounts or data. Moving to a different
+host is outside this standard restore path.
 
-1. **Each Pond's home**: its work, its handbook and its job records
-   (`.boring-crocodile/jobs.sqlite3`). This is the Pond's work and memory;
-   everything else can be set up again.
-2. `/etc/boring-crocodile`: configuration, approval secrets, receipts.
-3. The OAuth store: `boring-crocodile-admin oauth backup --output FILE`
-   writes a consistent SQLite copy while the site runs, into a folder only
-   root can read (it refuses any other).
-4. Services and Pirates: their own state folders (each one's README).
-
-The runtime, the units and the sockets are not data: a deploy and setup
-bring them back.
-
-To restore on the same host after a loss, with the same release deployed:
-
-    sudo systemctl stop boring-crocodile-mcp.target
-    # put back /etc/boring-crocodile (root, as it was) and the homes, each
-    # owned by its Pond's account; copy the OAuth backup to
-    # /var/lib/boring-crocodile/oauth.sqlite3, owned by the controller, 0600
-    sudo systemctl start boring-crocodile-mcp.target
-    sudo boring-crocodile-admin site-check
-    sudo boring-crocodile-admin status --check
-
-The accounts must still exist with the same names and IDs; site-check
-reports anything that does not fit. Moving a site to another host is not a
-path we have built: set it up fresh there and copy each home's contents in.
-
-Restoring an older OAuth store can bring back revoked grants or lose newer
-ones; a code rollback alone is not a reason to restore it. An update that
-changes a data format is the exception: the older release refuses the newer
-data, so going back means the backup taken before the update
-([updating](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/updating.md)).
+Restoring an older OAuth store can revive revoked grants or lose newer
+ones. A code rollback alone is no reason to restore it.
 
 ## Replacing an approval secret
 
-Each Pond's secret is one root file in `/etc/boring-crocodile/credentials/`:
-`approval-secret` for the first Pond, `NAME-approval-secret` for the others.
-Changing the secret prevents new approvals with the old value; it does not
-invalidate tokens clients already hold. To make those clients sign in again,
-replace the secret, restart the controller (which reads it at start), and
-revoke the Pond's existing grants. This example is for the first Pond, `pond`:
+Replacement is explicit. The first Pond's default file is
+`/etc/boring-crocodile/credentials/approval-secret`; others use
+`NAME-approval-secret`. The declared credential path is authoritative.
+Replacing it prevents new approvals with the old value, but does not
+invalidate issued tokens. For the first Pond:
 
     sudo sh -c 'umask 077; cd /etc/boring-crocodile/credentials && python3 -c "import secrets; print(secrets.token_urlsafe(32))" > approval-secret.new && mv approval-secret.new approval-secret'
-    sudo systemctl restart boring-crocodile-mcp.service
-    sudo boring-crocodile-admin oauth revoke --pond pond --all-clients      # shows the plan
-    sudo boring-crocodile-admin oauth revoke --pond pond --all-clients --apply --approve-digest DIGEST
-    sudo boring-crocodile-admin site-check
+    sudo boring-crocodile-setup --site-render --apply
+    sudo boring-crocodile-admin oauth revoke --pond pond --all-clients
+    sudo boring-crocodile-admin oauth revoke --pond pond --all-clients --apply
 
-Clients then sign in again with the new secret.
-
-## Logs
-
-journald first: `journalctl -u boring-crocodile-mcp -u 'boring-crocodile-worker-*'`.
-Secrets, environments and command output are not logged. `admin watch` shows
-a Pond live, best effort, root only; it is not an audit log.
+Keep the value in a private administrator terminal. Never put it in a URL,
+chat, command history or log.
 
 ## Uninstalling
 
-Choose whether you want to park a Pond for later or retire its identity.
-Without `--delete-data`, its accounts and grants remain so it can be brought
-back. With that flag, they are removed and retained homes are made private to
-root. Neither choice deletes the home contents for you.
-
     sudo boring-crocodile-admin uninstall --pond NAME
-    sudo boring-crocodile-admin uninstall --pond NAME --apply --approve-digest DIGEST
-    sudo boring-crocodile-admin uninstall --site [--delete-data]
+The family task page [Park or retire a Pond](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/retire-pond.md)
+owns the command sequence, checks and return path.
 
-Like every site change it reads the site as it is, runs `site-check` first
-and stops on anything irregular, shows its plan, and applies only that plan
-by digest. It holds the site lock.
+`uninstall --pond NAME` selects an added Pond; `--site` selects the site
+and its initial Pond. Without `--delete-data`, the scope is parked:
+accounts, secrets, UUIDs, grants, descriptions and homes remain. With it,
+the separate destructive plan retires admission and access after deactivation.
+Retained paths are sealed; accounts are locked and expired, with their UID/GID
+reserved because a Pirate may still trust those numbers. A selected added
+declaration is removed last.
 
-- `--pond NAME` takes one added Pond out: its sections leave `config.toml`,
-  its units (with drop-ins), tmpfiles file and runtime folders go. It stops
-  and starts the whole site target, so every Pond's connections drop briefly.
-  Stopping waits until the controller and every worker are down (each within
-  its stop timeout) before anything is removed.
-  The first Pond, `pond`, goes only with `--site`.
-- `--site` removes the whole integration: `config.toml`, the controller,
-  target and every Pond's units. Without `--delete-data` it first marks the
-  activation receipt `uninstalled` and records in it the Ponds that are live,
-  their ceilings and the Pirate callers. `boring-crocodile-setup --site-config`
-  (or `--site-wizard`) then installs the site again from the kept accounts,
-  homes, credentials and OAuth grants: the Ponds that were live, with their
-  ceilings, and the Pirate callers. A parked Pond stays parked
-  (`--site-extend --bring-back NAME` still takes it back). Everything else
-  (address, public origin, guests and `no_new_privileges` per Pond) comes
-  from the activation's own settings.
-- Without `--delete-data` a Pond is **parked**: accounts, groups, credential
-  and OAuth grants stay, and `--site-extend --bring-back NAME` takes it back.
-- `--delete-data` also removes the credentials, the Pond's OAuth grants and
-  service tokens (in one transaction; other callers stay), its `--add-pond`
-  folder and the accounts and groups (the site: also the controller account,
-  state folder and OAuth store). Apply refuses if an account changed since the
-  plan. Remove accounts in the same run as the site: afterwards uninstall has
-  nothing left to read them from.
-- `--pond NAME --delete-data` also works on a Pond that `config.toml` no
-  longer names (a parked Pond, or one an earlier apply left part-way): it
-  reads the Pond from its `--add-pond` folder and removes what is still
-  there. The folder goes last.
+Home contents are never recursively deleted. Whole-site retirement leaves
+removed-state descriptions for explicit archival, removes the OAuth store
+and reserves the controller's identity too. The family task page above gives
+the separate operator steps for releasing identities once no Pirate trusts them.
+Identity changes, unsafe paths/mounts, unsupported stores and external drop-ins
+referring to retiring groups refuse. Inspect
+the error and use the same approved scope on recovery; runtime files and
+PATH links are removed separately by the human if wanted.
 
-**Homes are never removed.** The result lists them as no longer live; delete
-them by hand once nothing in them is needed. With `--delete-data` the home's
-top folder then belongs to root (mode 0700): uninstall changes it before it
-removes the account, so an account created later with the same uid cannot
-read it. What is inside keeps its owner.
+## Crocodile and Pirates compatibility
 
-It refuses before any change when: site-check finds anything irregular,
-`config.toml` or the site target is missing, the Pond is unknown (or is
-`pond` with `--pond`), an account changed, the OAuth schema is unexpected, a
-removal would cross a mount or follow a symlink, a home to give to root is a
-symlink, a mount point or someone else's, the digest is stale, or
-another operation holds the lock.
+Install the matching Crocodile and Pirates set together; keep Pirate work
+stopped until both updates are complete. Wire-format changes bump the minor
+version. The Pirate release declares the Crocodile minor line it requires.
+At registration the Crocodile checks the Pirate's installed version against
+its declared range and names any refusal. The Crocodile admits only the
+Pirate/Pond pairs in its description; the Pirate trusts only accepted live
+worker sockets backed by the controller's proof. Crocodile-only installs
+remain supported. Render and Crocodile deploy do not inspect a Pirates release
+or the rendering interpreter's release metadata.
 
-To remove the runtime afterwards: `sudo rm -rf /opt/boring-crocodile` and the
-command links you put on PATH. Root's own records of site changes stay in
-`/var/lib/boring-crocodile-site` until you delete them. A deploy never
-uninstalls a site.
+## When a change stops part-way
 
-## When a site change stops part-way
+Keep the error, inspect what was saved and fix its stated cause. There is no
+resume flag, step ledger or automatic rollback.
 
-Every command that changes the site (setup and `--add-pond` apply, site
-activation, `--site-extend`, `--site-render`, `uninstall`, `pirate-add`, `pirate-remove`,
-`task-policy --apply`) holds the one site lock,
-`/etc/boring-crocodile/site.lock`; a second one refuses until the first has
-finished. Recovery records differ by command: setup has receipts, while other
-operations may leave changed files or completed steps. There is no single
-resume command for all of them. Keep the error and any backup path it names;
-inspect the state and fix the cause before following the matching row:
+At startup the controller serves all enabled Ponds or none. A broken main
+description or enabled Pond file stops startup. The controller journal,
+`status` and `site-check` name the broken file and include the line and
+column for TOML syntax errors. Correct the file by hand or restore it from a
+backup, then restart `boring-crocodile-mcp.service`. Render validates the
+description before deriving units and refuses a broken file.
 
-| Command | What to do |
+| Operation | Recovery |
 |---|---|
-| setup, `--add-pond` | Run it again with `--apply --resume`: its receipt records each account and folder it made. A stop while the home changes owner says so; inspect the home, then resume. |
-| site activation | Run it again with `--apply --resume`. |
-| `--site-extend` | Run it again. Service grants come first, so they are in place. If it stopped after `config.toml` names the new Pond (for example the controller restart failed), a re-run finds nothing to add: `systemctl restart boring-crocodile-mcp.service`, then `admin site-check`. |
-| `--site-render` | Before it writes (a refused unit, a changed site): nothing changed, run it again. After: a re-run plans nothing, since the files already match; the error names the backup and the steps left (`systemd-tmpfiles --create ...`, `systemctl daemon-reload`, `systemctl try-restart ...`): run those, then `admin site-check`. The site log has the line already. |
-| `pirate-add` | If `config.toml` does not name the Pirate yet, run it again: it adds the missing groups and restarts every worker it serves. If it does, run it again too: it restarts each worker that does not run with `pirate-clients` yet; after a first admission also `systemctl restart boring-crocodile-mcp.service`. Offering more Ponds changes no `config.toml`, so a re-run finishes it. |
-| `pirate-remove` | If `config.toml` still names the Pirate, run it again. If not, restart the units the plan listed under `restart`. |
-| `uninstall --pond` | With `--delete-data`, run it again: it reads the Pond from its `--add-pond` folder and removes what is left. Without, the Pond is parked once `config.toml` no longer names it; `systemctl start boring-crocodile-mcp.target` if the site is down. |
-| `uninstall --site` | Without `--delete-data`, run it again: the receipt is marked already, and it removes the site files that are left (`config.toml` last), without site-check. With `--delete-data`, run it again: the first run wrote what it removes to `/etc/boring-crocodile/uninstall.json` before anything went, and a re-run finishes from it (the state folder with that file last). |
-| `task-policy --apply` | It restores the previous drop-in itself; if that fails it says so and the worker stays stopped: inspect the drop-in, `systemctl daemon-reload`. |
+| Provisioning | Rerun the same inputs. Published declarations retain UUIDs and numeric bindings; existing secrets and handbook files stay. An unexpected identity/path requires review. |
+| Render, activation, extension or Pirate admission | Inspect the saved desired files, then rerun `--site-render --apply`. Its tail runs even when files match. If the command stopped before saving its requested candidate, rerun that command to propose it again. |
+| Extension with service grants | Grants already saved remain; inspect `service-list`. Rerun extension if the declaration is still parked; otherwise render repairs startup. |
+| Service policy | Read `service-list`, then replan the intended mutation. Never repeat `service-add` just to recover a lost one-time secret; inspect whether registration completed. |
+| Explicit retirement | Rerun the same `uninstall --delete-data` selection. Kept declarations bind cleanup to the reviewed identities until it finishes. |
 
-When `site-check` reports a file that belongs to no Pond of `config.toml`
-after such a stop, it is one the command had not removed yet: remove it by
-hand, then run the command again.
+Render reports local readiness separately from external registration.
+An error after publication can leave the desired configuration saved with
+incomplete runtime effects; a matching file is not proof that a unit started.
 
-## Administration of the host by a Pond
+## Logs and host administration
 
-Optional and deliberate: [PERMISSIONS](PERMISSIONS.md).
+Use journald:
+`journalctl -u boring-crocodile-mcp -u 'boring-crocodile-worker-*'`.
+Secrets, environments and command output are not logged. Root's
+`admin watch` is a best-effort live debugging view, not an audit log.
+Optional host administration by a Pond: [PERMISSIONS](PERMISSIONS.md).

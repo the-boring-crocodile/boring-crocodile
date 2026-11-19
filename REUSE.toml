@@ -13,6 +13,6 @@ SPDX-FileCopyrightText = "2026 Wald and the boring-crocodile contributors"
 SPDX-License-Identifier = "CC-BY-SA-4.0"
 
 [[annotations]]
-path = ["src/boring_crocodile/templates/HANDBOOK.md", "site/default/etc/**", "site/default/two-ponds/**"]
+path = ["src/boring_crocodile/handbooks/**", "site/default/etc/**", "site/default/two-ponds/**"]
 SPDX-FileCopyrightText = "2026 Wald and the boring-crocodile contributors"
 SPDX-License-Identifier = "CC0-1.0"

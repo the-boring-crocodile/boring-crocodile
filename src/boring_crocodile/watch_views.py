@@ -181,7 +181,8 @@ class WatchView:
                 # Only command jobs have an exit code; Pirate and batch jobs do not.
                 message = "exit=" + safe_text(str(event.get("exit_code")))
             elif state == "failed":
-                message = safe_text(str(event.get("error", "unknown error")))
+                message = (self._refusal(event["failure"]) if "failure" in event
+                           else safe_text(str(event.get("error", "unknown error"))))
             elif state == "refused":
                 message = self._refusal(event.get("refusal"))
             label = "exit error" if state == "completed" and event.get("exit_code") not in (0, None) else state

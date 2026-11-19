@@ -15,7 +15,8 @@ from boring_registry import PING_TIMEOUT_SECONDS
 from boring_service_kit.issuer.store import (Transaction as Transaction, create_tables,
                                              secret_key as secret_key, validate_tables)
 
-VERSION = 5
+VERSION = 6
+UPGRADES_FROM = 5
 # Records whose key is a bearer value. The key is stored as its SHA-256; the
 # payload field that repeats the value (if any) is stored blank. Nothing ever
 # needs a bearer value back: clients hold them, the store only verifies them.
@@ -26,13 +27,12 @@ SECRET_KINDS = {"pending": None, "code": "code", "access": "token", "refresh": "
                 "service": "token"}
 GRANTS = ("code", "access", "refresh")
 # Services the admin added: their credentials (the secret as SHA-256), their
-# MCP URL, the Ponds they are granted to (a JSON list of Pond names) and how
-# long a worker waits for their heartbeat.
-SERVICE_COLUMNS = ("name", "client_id", "secret_sha256", "url", "ponds", "ping_timeout")
+# MCP URL, service-declared roles/default, caller-to-role grants and heartbeat.
+SERVICE_COLUMNS = ("name", "client_id", "secret_sha256", "url", "callers", "roles", "default_role", "ping_timeout")
 
 
 def initialize(db: sqlite3.Connection) -> None:
-    """Create a new store, or check an existing one: schema 5 only."""
+    """Create/check6, or upgrade5 inside the issuer's startup transaction."""
     version = db.execute("PRAGMA user_version").fetchone()[0]
     if version == 0:
         if db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchone():
@@ -40,6 +40,8 @@ def initialize(db: sqlite3.Connection) -> None:
         create_tables(db)
         _create_services(db)
         db.execute(f"PRAGMA user_version={VERSION}")
+    elif version == UPGRADES_FROM:
+        _upgrade_5_to_6(db)
     elif version != VERSION:
         raise ValueError(f"OAuth store is schema {version}; this release reads schema {VERSION}")
     validate(db)
@@ -48,12 +50,45 @@ def initialize(db: sqlite3.Connection) -> None:
 def _create_services(db: sqlite3.Connection) -> None:
     db.execute(f"""CREATE TABLE services (
         name TEXT PRIMARY KEY, client_id TEXT NOT NULL UNIQUE,
-        secret_sha256 TEXT NOT NULL, url TEXT NOT NULL, ponds TEXT NOT NULL,
+        secret_sha256 TEXT NOT NULL, url TEXT NOT NULL, callers TEXT NOT NULL,
+        roles TEXT NOT NULL, default_role TEXT NOT NULL,
         ping_timeout REAL NOT NULL DEFAULT {PING_TIMEOUT_SECONDS})""")
 
 
-def validate(db: sqlite3.Connection) -> None:
-    if db.execute("PRAGMA user_version").fetchone()[0] != VERSION:
+def _upgrade_5_to_6(db: sqlite3.Connection) -> None:
+    """Only services change; issuer rows/credentials/tokens remain byte-for-byte."""
+    if not db.in_transaction:
+        raise ValueError("OAuth upgrade requires the startup transaction")
+    _validate_5(db)
+    db.execute("ALTER TABLE services RENAME TO services_5")
+    _create_services(db)
+    for name, client_id, secret, url, encoded, timeout in db.execute("SELECT * FROM services_5"):
+        members = json.loads(encoded)
+        if (not isinstance(members, list)
+                or any(not isinstance(member, str) or not member for member in members)
+                or len(set(members)) != len(members)):
+            raise ValueError("malformed schema-5 service membership")
+        callers = {member: "reader" for member in members}
+        db.execute("INSERT INTO services VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                   (name, client_id, secret, url, json.dumps(callers),
+                    json.dumps(["reader", "writer"]), "reader", timeout))
+    db.execute("DROP TABLE services_5")
+    db.execute(f"PRAGMA user_version={VERSION}")
+
+
+def _validate_5(db: sqlite3.Connection) -> None:
+    validate_tables(db)
+    columns = ("name", "client_id", "secret_sha256", "url", "ponds", "ping_timeout")
+    if tuple(row[1] for row in db.execute("PRAGMA table_info(services)")) != columns:
+        raise ValueError("unexpected OAuth service schema for upgrade from 5")
+
+
+def validate(db: sqlite3.Connection, *, upgrade_source: bool = False) -> None:
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if upgrade_source and version == UPGRADES_FROM:
+        _validate_5(db)  # Read-only backup before startup, not an admin upgrade.
+        return
+    if version != VERSION:
         raise ValueError("unsupported OAuth schema")
     validate_tables(db)
     if tuple(row[1] for row in db.execute("PRAGMA table_info(services)")) != SERVICE_COLUMNS:
@@ -126,34 +161,89 @@ from boring_worker_kit.service_contract import (SERVICE_NAME as SERVICE_NAME, se
     service_ping_timeout as service_ping_timeout, MAX_PING_TIMEOUT_SECONDS as MAX_PING_TIMEOUT_SECONDS)
 
 
-def add_service(db, name: str, url: str, ponds: list[str],
-                ping_timeout: float = PING_TIMEOUT_SECONDS) -> dict[str, object]:
-    """Create a service; the secret is returned here once and stored only as its hash."""
+def declared_roles(roles, default_role):
+    """The registered service owns its role vocabulary and default."""
+    if (not isinstance(roles, list) or not roles
+            or any(not isinstance(role, str) or not SERVICE_NAME.fullmatch(role) for role in roles)
+            or len(set(roles)) != len(roles) or default_role not in roles):
+        raise ValueError("service roles must be distinct names and include default_role")
+    return sorted(roles)
+
+
+def caller_roles(callers, roles):
+    if (not isinstance(callers, dict)
+            or any(not isinstance(name, str) or not name or role not in roles
+                   for name, role in callers.items())):
+        raise ValueError("malformed service caller grants: map each NAME to a declared ROLE; replace the old ponds list")
+    return dict(sorted(callers.items()))
+
+
+def service_add_plan(db, name: str, url: str, callers: dict[str, str],
+                     ping_timeout: float | None = None, *, roles: list[str],
+                     default_role: str) -> dict[str, object]:
+    """Validate creation without generating a credential or writing any row."""
     if not SERVICE_NAME.fullmatch(name):
         raise ValueError("service name must match [a-z0-9][a-z0-9-]{0,62}")
-    if not ponds or len(set(ponds)) != len(ponds):
-        raise ValueError("a service needs one or more distinct Ponds")
+    roles = declared_roles(roles, default_role)
+    callers = caller_roles(callers, roles)
     if db.execute("SELECT 1 FROM services WHERE name=?", (name,)).fetchone():
         raise ValueError(f"service {name!r} exists; remove it first to change it")
+    plan = {"name": name, "url": service_url(url), "callers": callers,
+            "roles": roles, "default_role": default_role,
+            "ping_timeout": service_ping_timeout(PING_TIMEOUT_SECONDS if ping_timeout is None else ping_timeout)}
+    return {**plan, "plan_digest": _service_plan_digest("add", plan)}
+
+
+def _service_plan_digest(operation: str, definition: object) -> str:
+    return hashlib.sha256(json.dumps([operation, definition], sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+
+def add_service(db, name: str, url: str, callers: dict[str, str],
+                ping_timeout: float | None = PING_TIMEOUT_SECONDS, *, roles: list[str],
+                default_role: str, digest: str | None = None) -> dict[str, object]:
+    """Create a service; a reviewed CLI creation checks its plan in this transaction."""
+    plan = service_add_plan(db, name, url, callers, ping_timeout, roles=roles, default_role=default_role)
+    if digest is not None and not secrets.compare_digest(digest, str(plan["plan_digest"])):
+        raise ValueError("service creation plan is stale; review a fresh plan")
     client_id, secret = "svc_" + secrets.token_urlsafe(16), secrets.token_urlsafe(32)
-    timeout = service_ping_timeout(ping_timeout)
-    db.execute("INSERT INTO services VALUES (?, ?, ?, ?, ?, ?)",
-               (name, client_id, secret_key(secret), service_url(url), json.dumps(ponds), timeout))
-    return {"name": name, "client_id": client_id, "client_secret": secret,
-            "url": url, "ponds": ponds, "ping_timeout": timeout}
+    db.execute("INSERT INTO services VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+               (name, client_id, secret_key(secret), plan["url"], json.dumps(plan["callers"]),
+                json.dumps(plan["roles"]), default_role, plan["ping_timeout"]))
+    return {**{key: value for key, value in plan.items() if key != "plan_digest"},
+            "client_id": client_id, "client_secret": secret}
 
 
-def remove_service(db, name: str, expected: dict[str, object] | None = None) -> bool:
+def _service_definition(found, expected):
+    public = {key: value for key, value in found.items() if key != "secret_sha256"}
+    if expected is not None and (not isinstance(expected, dict) or
+            json.dumps(expected, sort_keys=True, separators=(",", ":")) !=
+            json.dumps(public, sort_keys=True, separators=(",", ":"))):
+        raise ValueError("service definition changed; removal refused")
+    return public
+
+
+def service_remove_plan(db, name: str, expected: dict[str, object] | None = None) -> dict[str, object]:
+    """Review the identity/definition, never raw token values or a stored secret hash."""
+    found = service(db, name=name)
+    if found is None:
+        raise ValueError(f"no service named {name!r}")
+    public = _service_definition(found, expected)
+    return {**public, "tokens": "all tokens for this service",
+            "plan_digest": _service_plan_digest("remove", found)}
+
+
+def remove_service(db, name: str, expected: dict[str, object] | None = None, *,
+                   digest: str | None = None) -> bool:
     """Remove a service and every token minted for it."""
     found = service(db, name=name)
     if found is None:
         return False
-    if expected is not None:
-        public = {key: value for key, value in found.items() if key != "secret_sha256"}
-        if (not isinstance(expected, dict) or
-                json.dumps(expected, sort_keys=True, separators=(",", ":")) !=
-                json.dumps(public, sort_keys=True, separators=(",", ":"))):
-            raise ValueError("service definition changed; removal refused")
+    _service_definition(found, expected)
+    if digest is not None:
+        current = service_remove_plan(db, name, expected)["plan_digest"]
+        if not secrets.compare_digest(digest, str(current)):
+            raise ValueError("service removal plan is stale; review a fresh plan")
     db.execute("DELETE FROM services WHERE name=?", (name,))
     db.executemany("DELETE FROM records WHERE kind='service' AND key=?", [
         (row[0],) for row in db.execute("SELECT key, payload FROM records WHERE kind='service'")
@@ -161,57 +251,52 @@ def remove_service(db, name: str, expected: dict[str, object] | None = None) -> 
     return True
 
 
+def _service_row(row, *, secret=False):
+    roles = declared_roles(json.loads(row[5]), row[6])
+    result = {"name": row[0], "client_id": row[1], "url": row[3],
+              "callers": caller_roles(json.loads(row[4]), roles), "roles": roles,
+              "default_role": row[6], "ping_timeout": row[7]}
+    if secret:
+        result["secret_sha256"] = row[2]
+    return result
+
+
 def services(db) -> list[dict[str, object]]:
-    return [{"name": row[0], "client_id": row[1], "url": row[3], "ponds": json.loads(row[4]),
-             "ping_timeout": row[5]}
-            for row in db.execute("SELECT * FROM services ORDER BY name")]
+    return [_service_row(row) for row in db.execute("SELECT * FROM services ORDER BY name")]
 
 
 def caller_services(db, caller):
-    """Validate service grants before selective caller removal."""
-    affected = []
-    for entry in services(db):
-        callers = entry["ponds"]
-        if not isinstance(callers, list) or any(not isinstance(x, str) or not x for x in callers):
-            raise ValueError("malformed service caller grants")
-        if caller in callers:
-            affected.append(entry)
-    return affected
+    """The store's validated role grants, before selective caller removal."""
+    return [entry for entry in services(db) if caller in entry["callers"]]
 
 
 def revoke_caller(db, caller):
-    # Keep the service identity and other callers. An empty list grants nobody;
-    # deleting the service would also destroy credentials held by its operator.
+    # Keep all other roles and the service's credential/declaration, even when empty.
     for entry in caller_services(db, caller):
-        remaining = [name for name in entry["ponds"] if name != caller]
-        db.execute("UPDATE services SET ponds=? WHERE name=?",
-                   (json.dumps(remaining), entry["name"]))
+        remaining = {name: role for name, role in entry["callers"].items() if name != caller}
+        db.execute("UPDATE services SET callers=? WHERE name=?", (json.dumps(remaining), entry["name"]))
 
 
 def service(db, *, name: str | None = None, client_id: str | None = None) -> dict[str, object] | None:
     """One service by name or by client id, with its secret hash."""
     column, value = ("name", name) if name is not None else ("client_id", client_id)
     row = db.execute(f"SELECT * FROM services WHERE {column}=?", (value,)).fetchone()
-    if row is None:
-        return None
-    return {"name": row[0], "client_id": row[1], "secret_sha256": row[2], "url": row[3],
-            "ponds": json.loads(row[4]), "ping_timeout": row[5]}
+    return None if row is None else _service_row(row, secret=True)
 
 
-def service_grants(db, name: str, callers: list[str], digest: str | None = None) -> dict[str, object]:
-    """Review/CAS-update caller membership without rotating service credentials."""
-    if not callers or len(set(callers)) != len(callers) or any(not isinstance(x, str) or not x for x in callers):
-        raise ValueError("service grants need distinct nonempty caller names")
+def service_grants(db, name: str, callers: dict[str, str], digest: str | None = None) -> dict[str, object]:
+    """Review/CAS-update caller roles without rotating service credentials."""
     found = service(db, name=name)
     if found is None:
         raise ValueError("no such service")
-    public = {key: found[key] for key in ("name", "client_id", "url", "ping_timeout")}
-    plan = {**public, "before": found["ponds"], "after": sorted(callers)}
-    current = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    callers = caller_roles(callers, found["roles"])
+    public = {key: found[key] for key in ("name", "client_id", "url", "roles", "default_role", "ping_timeout")}
+    plan = {**public, "before": found["callers"], "after": callers}
+    current = _service_plan_digest("grants", {**plan, "credential_identity": found["secret_sha256"]})
     if digest is not None:
         if not secrets.compare_digest(digest, current):
             raise ValueError("service grant plan is stale; review a fresh plan")
-        db.execute("UPDATE services SET ponds=? WHERE name=?", (json.dumps(sorted(callers)), name))
+        db.execute("UPDATE services SET callers=? WHERE name=?", (json.dumps(callers), name))
     return {**plan, "plan_digest": current, "applied": digest is not None}
 
 
@@ -223,7 +308,8 @@ def service_endpoint(db, name: str, url: str, digest: str | None = None) -> dict
         raise ValueError("no such service")
     plan = {"name": found["name"], "client_id": found["client_id"],
             "before": found["url"], "after": target,
-            "callers": sorted(found["ponds"]), "ping_timeout": found["ping_timeout"]}
+            "callers": found["callers"], "roles": found["roles"],
+            "default_role": found["default_role"], "ping_timeout": found["ping_timeout"]}
     # Bind the approval to credential identity without exposing the secret hash.
     material = {**plan, "credential_identity": found["secret_sha256"]}
     current = hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

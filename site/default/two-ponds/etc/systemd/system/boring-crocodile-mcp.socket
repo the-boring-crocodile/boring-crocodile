@@ -1,0 +1,14 @@
+[Unit]
+PartOf=boring-crocodile-mcp.target
+Description=Boring Crocodile root-held controller listener
+
+[Socket]
+ListenStream=127.0.0.1:8503
+BindIPv6Only=ipv6-only
+Accept=no
+ReusePort=no
+FileDescriptorName=controller
+Service=boring-crocodile-mcp.service
+
+[Install]
+WantedBy=boring-crocodile-mcp.target

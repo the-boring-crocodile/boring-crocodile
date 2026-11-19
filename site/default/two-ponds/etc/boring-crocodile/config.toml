@@ -1,52 +1,23 @@
+
+[site]
+schema = 1
+state = "running"
+runtime_root = "/opt/boring-crocodile/current"
+
+[site.controller]
+name = "boring-crocodile-mcp"
+uid = 902
+group = "boring-crocodile-mcp"
+gid = 902
+home = "/nonexistent"
+shell = "/usr/sbin/nologin"
+
 [server]
 public_base_url = "https://mcp.example.invalid"
 bind_host = "127.0.0.1"
 bind_port = 8503
-allowed_hosts = ["mcp.example.invalid", "mcp.example.invalid:443", "127.0.0.1:8503"]
+protected_ports = [18510, 18511, 18512, 18513, 18514, 18515, 18516, 18517, 18518, 18519, 18520, 18521, 18522, 18523, 18524, 18525, 18526, 18527, 18528, 18529, 18530, 18531, 18532, 18533, 18534, 18535, 18536, 18537, 18538, 18539]
+allowed_hosts = ["mcp.example.invalid", "127.0.0.1:8503"]
+
 [auth]
 oauth_database_file = "/var/lib/boring-crocodile/oauth.sqlite3"
-[ponds.pond]
-profile_id = "00000000-0000-4000-8000-000000000001"
-display_name = "The Pond"
-environment = "pond"
-approval_secret_file = "/run/credentials/boring-crocodile-mcp.service/approval-secret"
-context_root = "/home/boring-crocodile/handbook"
-files = ["HANDBOOK.md", "WELCOME.md"]
-welcome_file = "WELCOME.md"
-[environments.pond]
-socket_path = "/run/boring-crocodile/workers/pond/control.sock"
-task_socket_path = "/run/boring-crocodile/tasks/pond.sock"
-task_unit_prefix = "boring-crocodile-task-pond"
-task_cgroup_parent = "/system.slice/system-crocodilepond.slice"
-default_cwd = "/home/boring-crocodile"
-allowed_roots = ["/home/boring-crocodile"]
-control_plane_uid = 902
-output_limit_bytes = 65536
-no_new_privileges = true
-[environments.pond.files.roots.home]
-path = "/home/boring-crocodile"
-read = true
-write = true
-
-[ponds.second]
-profile_id = "00000000-0000-4000-8000-000000000002"
-display_name = "second"
-environment = "second"
-approval_secret_file = "/run/credentials/boring-crocodile-mcp.service/second-approval-secret"
-context_root = "/home/boring-crocodile-second/handbook"
-files = ["HANDBOOK.md", "WELCOME.md"]
-welcome_file = "WELCOME.md"
-[environments.second]
-socket_path = "/run/boring-crocodile/workers/second/control.sock"
-task_socket_path = "/run/boring-crocodile/tasks/second.sock"
-task_unit_prefix = "boring-crocodile-task-second"
-task_cgroup_parent = "/system.slice/system-crocodilesecond.slice"
-default_cwd = "/home/boring-crocodile-second"
-allowed_roots = ["/home/boring-crocodile-second"]
-control_plane_uid = 902
-output_limit_bytes = 65536
-no_new_privileges = true
-[environments.second.files.roots.home]
-path = "/home/boring-crocodile-second"
-read = true
-write = true

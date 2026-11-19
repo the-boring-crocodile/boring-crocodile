@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import asyncio
 import logging
 import os
+import sqlite3
 from pathlib import Path
 import time
 from typing import Awaitable, Callable
@@ -15,9 +17,10 @@ from .handbook_context import ContextBootstrap
 from boring_worker_kit.framing import peer_uid, read_frame, write_frame
 from boring_worker_kit.host_limits import HostLimits, read_host_limits
 from .jobs import ManagedJobs
+from .image_tools import ImageReader
 from boring_worker_kit.observation import Observation
 from .pirates import Pirates, registration_path
-from boring_worker_kit.services import Services, ServiceFailure
+from boring_worker_kit.services import Services
 from boring_worker_kit.files import FileTools
 
 from boring_worker_kit.deadlines import REPLY_MARGIN_SECONDS, SERVICE_OPERATION_SECONDS, budget, deadline_after
@@ -29,8 +32,8 @@ from .batch import BatchRunner, FILE_METHODS, JOB_METHODS, SERVICE_METHODS
 from boring_worker_kit.inputs import MAX_JOB_SECONDS
 from .jobs import DEFAULT_JOB_SECONDS
 from boring_worker_kit.batch_contracts import BATCH_MAX_STEPS, BATCH_INPUT_BYTES, BATCH_RESULT_BYTES
-from .outcomes import Refusal
-from .settings import EnvironmentSettings, Settings
+from .outcomes import Refused, failure_data
+from .settings import EnvironmentSettings, Settings, PirateCaller
 from .unix_sockets import bound_identity, clear_stale_socket, release_socket
 
 BATCH_STEP_MARGIN = 0.1
@@ -39,21 +42,39 @@ logger = logging.getLogger(__name__)
 
 class WorkerServer:
     def __init__(self, settings: EnvironmentSettings, context: ContextBootstrap | None = None,
-                 pond: str | None = None) -> None:
+                 pond: str | None = None, *,
+                 pirate_callers: Mapping[str, PirateCaller] | None = None) -> None:
         self.settings = settings
         self.context = context
         self.limits = (read_host_limits(settings) if settings.task_socket_path else HostLimits(1, None)) if settings.command_execution_enabled else None
         self.executor = EnvironmentExecutor(settings, self.limits) if self.limits is not None else None
-        self.pirates = Pirates()
+        self.pirates = Pirates(pond=pond or settings.name, callers=pirate_callers)
         # Services know this worker by its Pond's name (the ping's clientInfo).
         self.services = Services(pond or settings.name)
         self.files = FileTools(settings.files, settings.socket_path.parent / "file-locks", settings)
+        self.images = ImageReader(self.files)
         self.batch = BatchRunner(self)
         # BatchRunner only stores this reference at construction time and reads
         # self.jobs later, when a request actually runs -- so building batch
         # before jobs (which needs batch, to run an operations-based job) is safe.
-        self.jobs = (ManagedJobs(settings, self.executor, self.batch, self.pirates)
-                     if self.executor is not None and settings.task_socket_path else None)
+        self.jobs: ManagedJobs | None = None
+        self.job_store_error: str | None = None
+        if self.executor is not None and settings.task_socket_path:
+            try:
+                self.jobs = ManagedJobs(settings, self.executor, self.batch, self.pirates)
+            except (OSError, ValueError, sqlite3.Error) as error:
+                self.job_store_error = (
+                    f"managed jobs unavailable: {type(error).__name__}: {error}; "
+                    "stop this worker, preserve and repair/archive its receipt store, then restart it")
+                logger.error("%s", self.job_store_error)
+
+    def require_jobs(self) -> ManagedJobs:
+        """The same admission decision for direct calls and an entire batch."""
+        if self.jobs is None:
+            if self.job_store_error is not None:
+                raise Refused("unavailable", self.job_store_error, component="job_store")
+            raise Refused("forbidden", "command execution is disabled or lacks a task runner")
+        return self.jobs
 
     def _command_limits(self) -> dict[str, object]:
         return (self.limits.public() if self.limits is not None
@@ -66,6 +87,7 @@ class WorkerServer:
             "command_execution_enabled": self.executor is not None,
             "command_limits": self._command_limits(),
             "managed_jobs_enabled": self.jobs is not None,
+            **({"managed_jobs_error": self.job_store_error} if self.job_store_error else {}),
             "pirates": self.pirates.list()["pirates"],
             "services": self.services.list()["services"],
             "files": self.settings.files.public(),
@@ -91,7 +113,7 @@ class WorkerServer:
             return await settled(operation) if job_id is not None else await operation
         if method == "exec":
             if self.executor is None:
-                raise Refusal("forbidden", "command execution is disabled")
+                raise Refused("forbidden", "command execution is disabled")
             # job_id/on_output are only set when this exec step is running
             # under a job (see ManagedJobs._run via BatchRunner.run): that
             # gives it the same streaming/job-aware admission a plain
@@ -102,16 +124,15 @@ class WorkerServer:
                                                foreground_deadline=deadline,
                                                job_id=job_id, on_output=on_output)
         if method in JOB_METHODS:
-            if self.jobs is None:
-                raise Refusal("forbidden", "command execution is disabled or lacks a task runner")
+            jobs = self.require_jobs()
             if method == "job_start":
-                return self.jobs.start(args.get("command"), args.get("cwd"),
+                return jobs.start(args.get("command"), args.get("cwd"),
                                        args.get("timeout_seconds"),
                                        operations=args.get("operations"),
                                        on_error=args.get("on_error", "stop"),
                                        pirate=args.get("pirate"))
             if method == "job_list":
-                return self.jobs.list(args.get("limit", 20))
+                return jobs.list(args.get("limit", 20))
             if method == "job_wait":
                 wait_seconds = args.get("wait_seconds", 45.0)
                 # "Inside a batch: 0 up to the remaining batch time" -- the step's
@@ -124,8 +145,8 @@ class WorkerServer:
                 if deadline is not None:
                     remaining = deadline - asyncio.get_running_loop().time()
                     wait_seconds = max(0.0, min(wait_seconds, remaining - BATCH_STEP_MARGIN))
-                return await self.jobs.wait(args.get("job_ids"), wait_seconds)
-            return getattr(self.jobs, method.removeprefix("job_"))(args.get("job_id"))
+                return await jobs.wait(args.get("job_ids"), wait_seconds)
+            return getattr(jobs, method.removeprefix("job_"))(args.get("job_id"))
         if method == "service_call":
             # Inside a batch the step ends REPLY_MARGIN_SECONDS before the batch's own deadline,
             # so its save (or refusal) is reported by the step instead of being cut off by the
@@ -135,7 +156,7 @@ class WorkerServer:
                                            else min(deadline - REPLY_MARGIN_SECONDS, limit))
         if method in SERVICE_METHODS:
             return self.services.list()
-        raise Refusal("invalid_request", "unsupported batch operation")
+        raise Refused("invalid_request", "unsupported batch operation")
 
     async def service_call(self, request: dict[str, object], deadline: float) -> dict[str, object]:
         """One service call, from the service_call tool or a batch step, within `deadline`.
@@ -168,7 +189,7 @@ class WorkerServer:
             result = await work
             state = "completed"
             return result
-        except Refusal as refusal:
+        except Refused as refusal:
             state, extra = "refused", {"code": refusal.code}
             raise
         except asyncio.CancelledError:
@@ -189,7 +210,7 @@ class WorkerServer:
         try:
             if peer_uid(writer) != self.settings.control_plane_uid:
                 # Decided before reading the request: a normal outcome, as data.
-                raise Refusal("forbidden", "only this Pond's control plane may call its worker")
+                raise Refused("forbidden", "only this Pond's control plane may call its worker")
             try:
                 request = await read_frame(reader)
             except (ConnectionError, asyncio.IncompleteReadError):
@@ -197,7 +218,7 @@ class WorkerServer:
                 return
             operation = request.get("operation")
             if not isinstance(operation, str):
-                raise Refusal("invalid_request", "operation is required")
+                raise Refused("invalid_request", "operation is required")
             # The control plane's budget for this request (deadlines.py); each
             # operation caps it by its own limit.
             carried = request.pop("budget_seconds", None)
@@ -206,16 +227,16 @@ class WorkerServer:
                     raise RuntimeError("No context configured for this worker")
                 project = request.get("project")
                 if project is not None and not isinstance(project, str):
-                    raise Refusal("invalid_request", "project must be a name or null")
+                    raise Refused("invalid_request", "project must be a name or null")
                 if project is not None and project not in self.context.projects:
-                    raise Refusal("not_found", "unknown project", project=project)
+                    raise Refused("not_found", "unknown project", project=project)
                 result = await asyncio.to_thread(self.context.load, project)
                 result["capabilities"] = self._capabilities()
             elif operation == "batch":
                 tokens = request.get("service_tokens")
                 if tokens is not None and (not isinstance(tokens, dict) or not all(
                         isinstance(k, str) and isinstance(v, str) for k, v in tokens.items())):
-                    raise Refusal("invalid_request", "service_tokens must map step IDs to tokens")
+                    raise Refused("invalid_request", "service_tokens must map step IDs to tokens")
                 execution = asyncio.create_task(self.batch.run(
                     request.get("batch"), service_tokens=tokens,
                     foreground_cap=budget(carried, float(FOREGROUND_REQUEST_SECONDS))))
@@ -229,11 +250,11 @@ class WorkerServer:
             elif operation == "service_call":
                 if set(request) - {"operation", "request_id"} not in ({"service", "tool", "arguments", "token"},
                                                                      {"service", "tool", "arguments", "token", "save_to"}):
-                    raise Refusal("invalid_request", "invalid service worker envelope")
+                    raise Refused("invalid_request", "invalid service worker envelope")
                 result = await self.service_call(request, deadline_after(budget(carried, SERVICE_OPERATION_SECONDS)))
             elif operation == "service_describe":
                 if set(request) - {"operation", "request_id"} != {"service", "token"}:
-                    raise Refusal("invalid_request", "invalid service worker envelope")
+                    raise Refused("invalid_request", "invalid service worker envelope")
                 result = await self._observed("service", operation, request.get("service"), None,
                                               self.services.describe(request["service"], request["token"],
                                                                      timeout=budget(carried, CALL_TIMEOUT_SECONDS)))
@@ -254,10 +275,9 @@ class WorkerServer:
                     return
                 result = await execution
             elif operation == "job_wait":
-                if self.jobs is None:
-                    raise Refusal("forbidden", "command execution is disabled or lacks a task runner")
+                jobs = self.require_jobs()
                 wait_seconds = request.get("wait_seconds")
-                execution = asyncio.create_task(self.jobs.wait(
+                execution = asyncio.create_task(jobs.wait(
                     request.get("job_ids"), 45.0 if wait_seconds is None else wait_seconds))
                 # A wait can run up to wait_seconds; a client that hangs up
                 # mid-wait should not keep this connection's coroutine alive.
@@ -268,12 +288,14 @@ class WorkerServer:
                 if disconnected in done:
                     return
                 result = await execution
-            elif operation in FILE_METHODS or operation in ("job_start", "list_jobs", "job_status", "job_output", "job_stop"):
+            elif operation == "file_read_image":
+                result = await self.images.call(request)
+            elif operation in FILE_METHODS or operation in ("job_start", "list_jobs", "job_output", "job_stop"):
                 method = "job_list" if operation == "list_jobs" else operation
                 result = await self.run_batch_step(method, {k: v for k, v in request.items() if k not in ("operation", "request_id")})
             elif operation == "exec":
                 if self.executor is None:
-                    raise Refusal("forbidden", "command execution is disabled")
+                    raise Refused("forbidden", "command execution is disabled")
                 execution = asyncio.create_task(self.executor.execute(
                     request.get("command"), request.get("cwd"),
                     request.get("timeout_seconds"),
@@ -288,9 +310,9 @@ class WorkerServer:
                     return
                 result = await execution
             else:
-                raise Refusal("invalid_request", "unknown worker operation")
+                raise Refused("invalid_request", "unknown worker operation")
             await write_frame(writer, {"ok": True, "result": result})
-        except Refusal as refusal:
+        except Refused as refusal:
             # A normal outcome: carried to the caller as data, with its code.
             try:
                 await write_frame(writer, {"ok": False, "refusal": refusal.as_data()})
@@ -298,10 +320,8 @@ class WorkerServer:
                 pass
         except Exception as error:
             # Everything else is a failure -- never disguised as a refusal.
-            logger.exception("worker request failed")
             try:
-                failure = (str(error) if isinstance(error, ServiceFailure)
-                           else f"{type(error).__name__}: {error}"[:512])
+                failure = failure_data(error)
                 await write_frame(writer, {"ok": False, "failure": failure})
             except ConnectionError:
                 pass
@@ -336,8 +356,7 @@ class WorkerServer:
         heartbeats = [asyncio.create_task(self.pirates.registry.run()),
                       asyncio.create_task(self.services.registry.run())]
         try:
-            if self.settings.service_registration_enabled:
-                registration = await self.pirates.listen(registration_path(self.settings.name))
+            registration = await self.pirates.listen(registration_path(self.settings.name))
             async with server:
                 await server.serve_forever()
         finally:
@@ -358,7 +377,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--environment", required=True)
     arguments = parser.parse_args()
-    settings = Settings.load(arguments.config)
+    settings = Settings.load(arguments.config, environment=arguments.environment)
     try:
         environment = settings.environments[arguments.environment]
     except KeyError as error:
@@ -368,7 +387,8 @@ def main() -> None:
     ponds = [name for name, pond in settings.ponds.items()
              if pond.environment == arguments.environment]
     asyncio.run(WorkerServer(environment, ContextBootstrap.for_environment(
-        settings, arguments.environment), pond=ponds[0] if ponds else None).serve())
+        settings, arguments.environment), pond=ponds[0] if ponds else None,
+        pirate_callers=settings.pirate_callers).serve())
 
 
 if __name__ == "__main__":

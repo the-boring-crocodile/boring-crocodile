@@ -1,0 +1,14 @@
+{
+  "ponds": [
+    "pond",
+    "garden"
+  ],
+  "pirates": {
+    "parrot": 1300
+  },
+  "pond_workers": {
+    "pond": 1201,
+    "garden": 1202
+  },
+  "public_base_url": "https://example.test"
+}

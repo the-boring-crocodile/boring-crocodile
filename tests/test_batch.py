@@ -67,6 +67,10 @@ class BatchSocketTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(f.endswith("start_line") for f in caught.exception.data["fields"]),
                         caught.exception.data)
         self.assertFalse((self.project / "x").exists())
+        with self.assertRaises(RefusalError) as caught:
+            await self.batch(write, step("retired", "job_status", job_id="0" * 32))
+        self.assertEqual(caught.exception.data["code"], "invalid_request")
+        self.assertFalse((self.project / "x").exists())
         result = await self.batch(write, step("read", "file_read", root="project", path="x"))
         self.assertEqual([e["status"] for e in result["results"]], ["succeeded", "succeeded"])
         self.assertEqual(result["results"][1]["result"]["content"], "hello")
@@ -85,7 +89,7 @@ class BatchSocketTest(unittest.IsolatedAsyncioTestCase):
         result = await self.batch(missing, write)
         self.assertEqual([e["status"] for e in result["results"]], ["refused", "not_started"])
         self.assertEqual(result["results"][0]["refusal"],
-                         {"code": "not_found", "message": "file does not exist"})
+                         {"status": "refused", "code": "not_found", "message": "file does not exist"})
         self.assertEqual(result["stop_reason"], "step_refused")
         self.assertFalse((self.project / "x").exists())
         result = await self.batch(missing, write, on_error="continue")
@@ -102,12 +106,12 @@ class BatchSocketTest(unittest.IsolatedAsyncioTestCase):
         async def large(method, args, deadline, **kwargs):
             if method == "job_start":
                 return {"job_id": "j" * 32, "state": "queued", "created_at": 1.0,
-                        "updated_at": 1.0, "note": "n" * 3000}
-            return {"content": "c" * 3000, "sha256": "0" * 64, "bytes": 3000}
+                        "updated_at": 1.0, "note": "n" * 12000}
+            return {"content": "c" * 12000, "sha256": "0" * 64, "bytes": 12000}
         operations = (step("start", "job_start", command="true"),
                       step("read", "file_read", root="project", path="x"))
         with patch.object(self.worker, "run_batch_step", side_effect=large), \
-                patch.object(batch_module, "_RESULT_CEILING", 1500):
+                patch.object(batch_module, "_RESULT_CEILING", 16384):
             result = await self.batch(*operations)
         self.assertEqual([(e["id"], e["status"]) for e in result["results"]],
                          [("start", "succeeded"), ("read", "succeeded")])
@@ -116,13 +120,69 @@ class BatchSocketTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("result", result["results"][1])
         self.assertTrue(result["results"][1]["result_truncated"])
         self.assertEqual(result["stop_reason"], "output_limit")
-        # Should even the receipts not fit, that is a genuine failure.
-        with patch.object(self.worker, "run_batch_step", side_effect=large), \
+        # A budget too small for receipts refuses before any owner can run.
+        with patch.object(self.worker, "run_batch_step", side_effect=large) as run, \
                 patch.object(batch_module, "_RESULT_CEILING", 10), \
-                self.assertLogs("boring_crocodile.worker", "ERROR"), \
-                self.assertRaisesRegex(RuntimeError, "even after reducing") as caught:
+                self.assertRaisesRegex(RefusalError, "cannot hold every step"):
             await self.batch(*operations)
-        self.assertNotIsInstance(caught.exception, RefusalError)
+        run.assert_not_called()
+
+    async def test_effected_steps_keep_service_receipts_after_oversized_failure(self):
+        import boring_crocodile.batch as batch_module
+        from boring_worker_kit.services import ServiceFailure
+        original = self.worker.run_batch_step
+        receipts = {"saved_to": {"root": "project", "path": "saved", "sha256": "a" * 64},
+                    "save_to_refused": {"status": "refused", "code": "stale", "message": "changed"},
+                    "save_to_failed": {"status": "failed", "code": "timeout", "message": "unknown"}}
+        for name, receipt in receipts.items():
+            with self.subTest(receipt=name):
+                async def run(method, args, deadline, **kwargs):
+                    if method != "service_call":
+                        return await original(method, args, deadline, **kwargs)
+                    if args["tool"] == "save":
+                        return {name: receipt, "service_ran": True,
+                                "content": [{"type": "text", "text": "x" * 20000}]}
+                    raise ServiceFailure({"status": "failed", "code": "provider_problem",
+                                          "message": "service failed", "effects": "unknown",
+                                          "details": ["x" * (2 * 1024 * 1024)]})
+                operations = [step("write", "file_write", root="project", path=name,
+                                   content="effect happened", expected_sha256=None),
+                              step("saved", "service_call", service="example", tool="save", arguments={}),
+                              step("failed", "service_call", service="example", tool="fail", arguments={})]
+                with patch.object(self.worker, "run_batch_step", side_effect=run), \
+                        patch.object(batch_module, "_RESULT_CEILING", 16384):
+                    result = await batch_module.BatchRunner(self.worker).run(
+                        {"operations": operations, "on_error": "continue"},
+                        service_tokens={"saved": "token", "failed": "token"})
+                self.assertEqual((self.project / name).read_text(), "effect happened")
+                self.assertEqual([entry["status"] for entry in result["results"]],
+                                 ["succeeded", "failed" if name != "saved_to" else "succeeded", "failed"])
+                saved, failure = result["results"][1:]
+                self.assertEqual(saved["result"], {name: receipt, "service_ran": True})
+                self.assertTrue(saved["result_truncated"])
+                self.assertEqual(failure["failure"]["code"], "provider_problem")
+                self.assertTrue(failure["result_truncated"])
+                self.assertTrue(failure["failure"]["details_omitted"])
+                self.assertEqual(result["stop_reason"], "output_limit")
+                self.assertLessEqual(batch_module._size({"ok": True, "result": result}), 16384)
+
+    async def test_oversized_refusal_is_bounded_and_marked_after_a_write(self):
+        import boring_crocodile.batch as batch_module
+        from boring_crocodile.outcomes import Refused
+        original = self.worker.run_batch_step
+        async def run(method, args, deadline, **kwargs):
+            if method == "file_read":
+                raise Refused("forbidden", "no", details=["x" * (2 * 1024 * 1024)])
+            return await original(method, args, deadline, **kwargs)
+        with patch.object(self.worker, "run_batch_step", side_effect=run):
+            result = await self.batch(
+                step("write", "file_write", root="project", path="effect", content="done", expected_sha256=None),
+                step("refused", "file_read", root="project", path="effect"))
+        self.assertEqual((self.project / "effect").read_text(), "done")
+        self.assertEqual([entry["status"] for entry in result["results"]], ["succeeded", "refused"])
+        self.assertTrue(result["results"][1]["result_truncated"])
+        self.assertTrue(result["results"][1]["refusal"]["details_omitted"])
+        self.assertLessEqual(batch_module._size({"ok": True, "result": result}), batch_module._RESULT_CEILING)
 
     async def test_stop_continue_and_command_execution(self):
         self.worker.executor = EnvironmentExecutor(self.settings, HostLimits(1, None))
@@ -188,8 +248,8 @@ class BatchSocketTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(second["status"], {"failed", "unknown", "refused"})
         if second["status"] == "refused":  # refused only when it never started
             self.assertEqual(second["refusal"]["code"], "not_admitted")
-        if second["status"] == "failed" and "ForegroundInterrupted" in second.get("error", ""):
-            self.assertIn("may have started", second["error"])
+        if second["status"] == "failed" and second.get("failure", {}).get("code") == "foreground_interrupted":
+            self.assertIn("may have started", second["failure"]["message"])
         self.assertEqual(result["results"][2]["status"], "not_started")
         self.assertFalse((self.project / "later").exists())
         # A command stopped before its echo leaves no (or an empty) pid file:
@@ -325,23 +385,25 @@ class BatchSocketTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(.01)
         self.assertEqual(current["state"], "completed")
         self.assertEqual(current["result"]["stdout"], "job-ok")
-        status = await self.batch(step("status", "job_status", job_id=receipt["job_id"]))
-        self.assertEqual(status["results"][0]["result"]["state"], "completed")
+        status = await self.batch(step("status", "job_wait", job_ids=[receipt["job_id"]], wait_seconds=0))
+        self.assertEqual(status["results"][0]["result"]["jobs"][0]["state"], "completed")
 
     async def test_job_steps_take_a_server_minted_job_id(self):
         self.worker.executor = EnvironmentExecutor(self.settings, HostLimits(1, None))
         job_settings = replace(self.settings, task_socket_path=self.project / "unused.sock")
         self.worker.jobs = ManagedJobs(job_settings, self.worker.executor)
-        for bad in (step("s", "job_status", job_id="my-key"),
+        for bad in (step("s", "job_output", job_id="my-key"),
                     step("s", "job_output", job_id="A" * 32),
                     step("s", "job_stop", selector="0" * 32),
                     step("s", "job_start", command="true", idempotency_key="k")):
             with self.assertRaisesRegex(RefusalError, '"invalid_request"'):
                 await self.batch(bad)
         self.assertEqual(self.worker.jobs.list()["jobs"], [])
-        unknown = await self.batch(step("s", "job_status", job_id="0" * 32))
-        self.assertEqual(unknown["results"][0]["status"], "refused")
-        self.assertEqual(unknown["results"][0]["refusal"]["code"], "not_found")
+        unknown = await self.batch(step("s", "job_wait", job_ids=["0" * 32], wait_seconds=0))
+        self.assertEqual(unknown["results"][0]["status"], "succeeded")
+        self.assertEqual(unknown["results"][0]["result"]["jobs"][0]["refusal"]["code"], "not_found")
+        malformed = await self.batch(step("s", "job_wait", job_ids=["my-key"], wait_seconds=0))
+        self.assertEqual(malformed["results"][0]["result"]["jobs"][0]["refusal"]["code"], "invalid_request")
 
     async def test_job_wait_step_clamps_to_batch_deadline_and_reports_unknown_ids(self):
         self.worker.executor = EnvironmentExecutor(self.settings, HostLimits(1, None))

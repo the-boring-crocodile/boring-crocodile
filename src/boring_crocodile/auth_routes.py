@@ -10,6 +10,7 @@ from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import Response, JSONResponse
 from .http_bodies import BodyRefused, bounded_body
+from boring_outcomes import Refused
 from .settings import Settings
 from boring_service_kit.issuer import ConsentDetails
 from boring_service_kit.issuer.web import approval_route
@@ -19,7 +20,7 @@ from .worker_client import WorkerClient
 logger = logging.getLogger("boring_crocodile.control_plane")
 
 def service_refusal(status: int, code: str, message: str) -> JSONResponse:
-    return JSONResponse({"error": {"code": code, "message": message}}, status_code=status,
+    return JSONResponse(Refused(code, message).as_data(), status_code=status,
                         headers={"WWW-Authenticate": 'Basic realm="services"'} if status == 401 else None)
 
 
@@ -50,8 +51,8 @@ def register_auth_routes(mcp: MCPServer, settings: Settings,
         name, url = str(granted["name"]), str(granted["url"])
         ping_timeout = float(cast(float, granted["ping_timeout"]))
         catalog = settings.ponds
-        ponds = [pond for pond in cast(list[str], granted["ponds"]) if pond in catalog]
-        for pond in cast(list[str], granted["ponds"]):
+        ponds = [pond for pond in cast(dict[str, str], granted["callers"]) if pond in catalog]
+        for pond in cast(dict[str, str], granted["callers"]):
             if pond not in catalog and pond not in {"pirate/" + name for name in settings.pirate_service_callers}:
                 logger.warning("service %s is granted to Pond %s, which is not configured", name, pond)
         answers = await asyncio.gather(*(

@@ -26,10 +26,6 @@ def task_directives(no_new_privileges: bool, home: str) -> str:
             "CapabilityBoundingSet=~\nRestrictSUIDSGID=no\nLockPersonality=no")
 
 
-def task_dropin(no_new_privileges: bool, home: str) -> str:
-    return "[Service]\n" + task_directives(no_new_privileges, home) + "\n"
-
-
 def expected_properties(no_new_privileges, home):
     """Properties systemd exposes for the maintained directive mapping."""
     result = dict(line.split("=", 1) for line in task_directives(no_new_privileges, home).splitlines())

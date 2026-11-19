@@ -26,7 +26,7 @@ import uvicorn
 from mcp import types
 
 from boring_worker_kit import services
-from boring_crocodile.outcomes import Refusal, RefusalError, FailureReport
+from boring_crocodile.outcomes import Refused, RefusalError, FailureReport
 from boring_worker_kit.services import ServiceFailure, Services
 from boring_crocodile.settings import EnvironmentSettings
 from boring_crocodile.worker import WorkerServer
@@ -62,7 +62,7 @@ class ExampleService:
 
         @mcp.tool()
         def refuse() -> dict:
-            raise ToolError(json.dumps({"code": "quota_exceeded", "message": "try tomorrow", "retry": 1}))
+            raise ToolError(json.dumps({"status": "refused", "code": "quota_exceeded", "message": "try tomorrow", "retry": 1}))
 
         @mcp.tool()
         def broken() -> dict:
@@ -156,45 +156,45 @@ class ServicesTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_errors_are_the_services_refusals(self):
         self.register()
-        with self.assertRaises(Refusal) as caught:
+        with self.assertRaises(Refused) as caught:
             await self.services.call("canvas", "refuse", {}, "good")
         self.assertEqual(caught.exception.as_data(),
-                         {"code": "quota_exceeded", "message": "try tomorrow", "retry": 1})
+                         {"status": "refused", "code": "quota_exceeded", "message": "try tomorrow", "retry": 1})
         with self.assertRaises(ServiceFailure) as caught:
             await self.services.call("canvas", "broken", {}, "good")
-        self.assertEqual(caught.exception.data["code"], "tool_error")
+        self.assertEqual(caught.exception.data["code"], "upstream_error")
         self.assertIn("the paint ran out", caught.exception.data["message"])
         with self.assertRaises(ServiceFailure) as caught:
             await self.services.call("canvas", "missing", {}, "good")
-        self.assertEqual(caught.exception.data["code"], "tool_error")
+        self.assertEqual(caught.exception.data["code"], "upstream_error")
 
     async def test_a_rejected_token_is_forbidden(self):
         self.register()
         for token in ("stolen", "narrow"):  # HTTP 401, 403
             for request in (self.services.describe("canvas", token),
                             self.services.call("canvas", "echo", {"text": "hi"}, token)):
-                with self.subTest(token=token), self.assertRaises(Refusal) as caught:
+                with self.subTest(token=token), self.assertRaises(Refused) as caught:
                     await request
                 self.assertEqual(caught.exception.as_data(), {
-                    "code": "forbidden", "message": "the service rejected the call token"})
+                    "status": "refused", "code": "forbidden", "message": "the service rejected the call token"})
         self.assertEqual(self.service.tokens_seen, [])
 
     async def test_unknown_unavailable_and_malformed(self):
-        with self.assertRaises(Refusal) as caught:
+        with self.assertRaises(Refused) as caught:
             await self.services.call("canvas", "echo", {}, "good")
         self.assertEqual(caught.exception.code, "not_found")
         for request in ({"name": "Canvas", "url": self.service.url}, {"name": "canvas", "url": "ftp://x/"},
                         {"name": "canvas"}):
-            with self.subTest(request=request), self.assertRaises(Refusal) as caught:
+            with self.subTest(request=request), self.assertRaises(Refused) as caught:
                 self.services.register(request)
             self.assertEqual(caught.exception.code, "invalid_request")
         self.register()
         for tool, arguments, token in (("", {}, "good"), ("echo", [], "good"), ("echo", {}, "")):
-            with self.assertRaises(Refusal) as caught:
+            with self.assertRaises(Refused) as caught:
                 await self.services.call("canvas", tool, arguments, token)
             self.assertEqual(caught.exception.code, "invalid_request")
         with patch.object(services, "MAX_SERVICES", 1):
-            with self.assertRaises(Refusal) as caught:
+            with self.assertRaises(Refused) as caught:
                 self.services.register({"name": "other", "url": self.service.url})
             self.assertEqual(caught.exception.code, "limit")
             self.register()  # re-registering a known service is no new entry
@@ -204,7 +204,7 @@ class ServicesTest(unittest.IsolatedAsyncioTestCase):
         await self.services.registry.ping_all()
         await self.service.stop()
         # Before the next ping: the connection is refused, nothing was sent.
-        with self.assertRaises(Refusal) as caught:
+        with self.assertRaises(Refused) as caught:
             await self.services.call("canvas", "echo", {"text": "hi"}, "good")
         self.assertEqual(caught.exception.code, "unavailable")
         self.assertIn("nothing was sent", caught.exception.message)
@@ -212,7 +212,7 @@ class ServicesTest(unittest.IsolatedAsyncioTestCase):
         listed = self.services.list()["services"][0]
         self.assertEqual((listed["available"], listed["misses"]), (False, 1))
         self.assertIn("ConnectError", listed["last_miss"])
-        with self.assertRaises(Refusal) as caught:
+        with self.assertRaises(Refused) as caught:
             await self.services.describe("canvas", "good")
         self.assertEqual(caught.exception.code, "unavailable")
         # A restarted service on the same URL: the next ping finds it again.
@@ -312,8 +312,12 @@ class WorkerServiceTest(unittest.IsolatedAsyncioTestCase):
     async def test_a_timeout_reaches_the_caller_as_a_failure(self):
         await self.client.service_register("test", "canvas", self.service.url, 1.0)
         with patch.object(services, "CALL_TIMEOUT_SECONDS", 0.2):
-            with self.assertRaisesRegex(FailureReport, "may have run"):
+            with self.assertRaises(FailureReport) as caught:
                 await self.client.service_call("test", "canvas", "slow", {}, "good")
+        self.assertEqual((caught.exception.data["status"], caught.exception.data["code"],
+                          caught.exception.data["effects"]), ("failed", "timeout", "unknown"))
+        self.assertEqual(caught.exception.data["message"],
+                         "TimeoutError: The Worker failed; see its log for details.")
 
 
 class ServiceDeadlineTest(unittest.IsolatedAsyncioTestCase):

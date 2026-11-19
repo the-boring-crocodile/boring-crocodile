@@ -5,6 +5,7 @@ from .file_tools import register_file_tools
 from .task_tools import register_task_tools
 
 import asyncio
+from importlib.metadata import version
 from typing import Any, Callable, cast
 import json
 import logging
@@ -26,7 +27,7 @@ from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
 from mcp.server.streamable_http_manager import StreamableHTTPASGIApp
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AnyHttpUrl, ConfigDict, ValidationError
 from starlette.applications import Starlette
 from starlette.authentication import AuthCredentials, BaseUser
 from starlette.middleware import Middleware
@@ -41,6 +42,7 @@ from .shared_guide import load_shared_guide
 from .sqlite_oauth_provider import SQLiteOAuthProvider, canonical_resource
 from .instructions import SERVER_INSTRUCTIONS
 from .settings import PondSettings, Settings
+from .site_ports import service_port_allowed
 from .worker_client import WorkerClient
 
 logger = logging.getLogger(__name__)
@@ -57,14 +59,6 @@ SERVICE_TOKEN_RENEW_SECONDS = 900
 # Where the SDK puts its own transport route; create_http_app removes it.
 SDK_TRANSPORT_PATH = "/mcp"
 
-
-
-
-
-class PondProfile(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    id: str = Field(min_length=1, pattern=r"\S")
-    name: str
 
 
 
@@ -151,7 +145,9 @@ def create_control_plane(settings: Settings, provider: SQLiteOAuthProvider | Non
     def granted_to(pond_name: str, service: str) -> dict[str, object] | None:
         """The store owns grants; a worker's registry only knows who answers."""
         granted = provider.service(service)
-        if granted is None or pond_name not in cast(list[str], granted["ponds"]):
+        if granted is None or pond_name not in cast(dict[str, str], granted["callers"]):
+            return None
+        if not service_port_allowed(str(granted["url"]), settings.protected_ports, settings.bind_port):
             return None
         return granted
 
@@ -174,6 +170,7 @@ def create_control_plane(settings: Settings, provider: SQLiteOAuthProvider | Non
         return pond.environment, await asyncio.to_thread(tokens.token, name, granted)
     mcp = MCPServer(
         "boring-crocodile",
+        version=version("boring-crocodile-mcp"),
         instructions=SERVER_INSTRUCTIONS,
         auth_server_provider=provider,
         auth=AuthSettings(
@@ -192,23 +189,6 @@ def create_control_plane(settings: Settings, provider: SQLiteOAuthProvider | Non
             validate_token_resource=False,
         ),
     )
-
-    @mcp.tool(meta={"openai/profile": True}, annotations=ToolAnnotations(
-        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
-    def pond_profile() -> PondProfile:
-        """Establish whose Pond you've landed in. Identify the authorized profile."""
-        pond = bound_pond()
-        return PondProfile(id=pond.profile_id, name=pond.display_name)
-
-    @mcp.tool()
-    def pond_ping() -> dict[str, object]:
-        """Poke the water. Check that the Pond answers. Harmless connectivity probe."""
-        pond = bound_pond()
-        return {
-            "message": f"authenticated {pond.display_name} says <^==>",
-            "architecture": "control-plane-with-environment-workers",
-            "environments": [pond.environment],
-        }
 
     @mcp.tool(
         annotations=ToolAnnotations(
@@ -260,17 +240,6 @@ def create_control_plane(settings: Settings, provider: SQLiteOAuthProvider | Non
         if not settings.environments[selected].command_execution_enabled:
             raise refuse("forbidden", "Command execution is disabled for this Pond")
         return selected
-
-    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False,
-                                           idempotent_hint=True, open_world_hint=False))
-    async def pond_limits() -> dict[str, object]:
-        """Check how long and how much can run here. The banks are there for a reason.
-
-        Reports the connected Pond's task slots, foreground budget and the
-        longest a command job may run. The hosted client's deadline is
-        separate and may be shorter.
-        """
-        return await workers.limits(selected_environment())
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False,
                                         idempotent_hint=True, open_world_hint=False))
@@ -374,23 +343,11 @@ def _present_tool(tool: Any, strict: Any) -> None:
         except ToolError as error:
             # MCP 2.2 wraps tool exceptions inside Tool.run. The original
             # typed outcome remains in __cause__; never parse its text.
-            cause = error.__cause__
-            if isinstance(cause, RefusalError):
+            cause = error if isinstance(error, (RefusalError, FailureReport)) else error.__cause__
+            if isinstance(cause, (RefusalError, FailureReport)):
                 data = cause.data
-            elif isinstance(cause, FailureReport):
-                data = {"failure": cause.failure}
             else:
                 raise
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(data, ensure_ascii=False, separators=(",", ":")))],
-                structured_content=data, is_error=True)
-        except RefusalError as refusal:
-            data = refusal.data
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(data, ensure_ascii=False, separators=(",", ":")))],
-                structured_content=data, is_error=True)
-        except FailureReport as failure:
-            data = {"failure": failure.failure}
             return CallToolResult(
                 content=[TextContent(type="text", text=json.dumps(data, ensure_ascii=False, separators=(",", ":")))],
                 structured_content=data, is_error=True)
@@ -467,12 +424,21 @@ def create_http_app(settings: Settings) -> tuple[MCPServer, Starlette]:
 
 
 def main() -> None:
+    import argparse
     import uvicorn
 
-    settings = Settings.load()
+    parser = argparse.ArgumentParser(description="Serve the enabled Ponds named by the generated unit.")
+    parser.add_argument("--ponds", nargs="+", required=True)
+    args = parser.parse_args()
+    try:
+        settings = Settings.load(ponds=tuple(args.ponds))
+    except (ValueError, OSError, KeyError) as error:
+        parser.exit(1, f"{error}\n")
     control_plane, app = create_http_app(settings)
-    uvicorn.Server(uvicorn.Config(app, host=settings.bind_host, port=settings.bind_port,
-                                  log_level=control_plane.settings.log_level.lower())).run()
+    from .controller_socket import take_listener
+    with take_listener(settings.bind_host, settings.bind_port) as listener:
+        uvicorn.Server(uvicorn.Config(app, host=settings.bind_host, port=settings.bind_port,
+                                      log_level=control_plane.settings.log_level.lower())).run(sockets=[listener])
 
 
 if __name__ == "__main__":

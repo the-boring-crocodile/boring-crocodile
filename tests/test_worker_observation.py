@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from boring_worker_kit.framing import read_frame, write_frame
-from boring_crocodile.outcomes import Refusal
+from boring_crocodile.outcomes import Refused
 from boring_worker_kit.file_policy import FilePolicy
 from boring_crocodile.settings import EnvironmentSettings
 from boring_crocodile.worker import WorkerServer
@@ -75,7 +75,7 @@ class WorkerObservationTest(WorkerHarness):
 
     async def test_refusal_keeps_its_code_and_stays_the_outcome(self):
         async def describe(pirate, flavour, timeout):
-            raise Refusal("busy", "Parrot is busy")
+            raise Refused("busy", "Parrot is busy")
         with patch.object(self.worker.pirates, "describe", describe):
             answer = await self.ask({"operation": "pirate_describe", "pirate": "parrot", "flavour": "paint"})
         self.assertEqual(answer["refusal"]["code"], "busy")
@@ -138,13 +138,13 @@ class WorkerBudgetTest(WorkerHarness):
     async def test_no_time_left_is_refused_before_the_call(self):
         save_to = {"root": "work", "path": "out.txt", "expected_sha256": None}
         answer, seen = await self.ask_service("service_call", 4, save_to=save_to)
-        self.assertEqual((seen, answer["refusal"]["code"]), ([], "limit"))  # 5 s are kept for the save
+        self.assertEqual((seen, answer["refusal"]["code"]), ([], "not_admitted"))  # 5 s are kept for the save
         answer, seen = await self.ask_service("service_call", 10, save_to=save_to)
         self.assertTrue(answer["ok"])
         self.assertLessEqual(seen[0], 5)
         self.assertEqual((Path(self.temp.name) / "work" / "out.txt").read_text(), "ok")
         answer, seen = await self.ask_service("service_call", 0)
-        self.assertEqual((seen, answer["refusal"]["code"]), ([], "limit"))  # zero is no time, not the cap
+        self.assertEqual((seen, answer["refusal"]["code"]), ([], "not_admitted"))  # zero is no time, not the cap
 
 
 if __name__ == "__main__":

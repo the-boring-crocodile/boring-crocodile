@@ -5,9 +5,10 @@ After=systemd-tmpfiles-setup.service local-fs.target boring-crocodile-task-pond.
 
 [Service]
 Type=simple
+Slice=system-crocodilepond.slice
 User=boring-crocodile
 Group=boring-crocodile
-UMask=0007
+UMask=0027
 ExecStart=/opt/boring-crocodile/current/bin/boring-crocodile-worker --config /etc/boring-crocodile/config.toml --environment pond
 Restart=on-failure
 RestartSec=2
@@ -15,7 +16,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/run/boring-crocodile/workers /home/boring-crocodile
+ReadWritePaths=/run/boring-crocodile/guests/pond /run/boring-crocodile/workers /home/boring-crocodile
 CapabilityBoundingSet=
 LockPersonality=yes
 RestrictSUIDSGID=yes

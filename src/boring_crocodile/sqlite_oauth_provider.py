@@ -105,7 +105,7 @@ class SQLiteOAuthProvider(SQLiteIssuer):
 
     def mint_service_token(self, pond: str, granted: dict[str, object], seconds: int) -> AccessToken:
         """A short-lived token for one Pond's calls to one service."""
-        if pond not in granted["ponds"]:
+        if pond not in granted["callers"]:
             raise ValueError("caller has no service grant")
         value = self._new_token("service_")
         token = AccessToken(token=value, client_id=str(granted["client_id"]), scopes=[],
@@ -122,7 +122,8 @@ class SQLiteOAuthProvider(SQLiteIssuer):
             if found.subject not in self.pirate_service_principals:
                 return {"active": False}
         if (found is None or found.resource != granted["url"]
-                or found.client_id != granted["client_id"] or found.subject not in granted["ponds"]):
+                or found.client_id != granted["client_id"] or found.subject not in granted["callers"]):
             return {"active": False}
         return {"active": True, "sub": found.subject, "aud": found.resource,
-                "exp": found.expires_at, "client_id": found.client_id}
+                "exp": found.expires_at, "client_id": found.client_id,
+                "role": granted["callers"][found.subject]}

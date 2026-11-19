@@ -20,7 +20,7 @@ from boring_worker_kit.framing import read_frame, write_frame
 from boring_crocodile.oauth_records import Transaction, add_service
 from boring_crocodile.settings import Settings
 from boring_crocodile.sqlite_oauth_provider import SQLiteOAuthProvider
-from pond_config import dynamic
+from pond_config import dynamic, runtime_settings
 
 URL = "http://127.0.0.1:18511/mcp"
 
@@ -47,7 +47,7 @@ dynamic_registration = true
         for name in ("alpha", "beta"):
             (self.root / name).mkdir()
             (self.root / name / "contract.md").write_text(name)
-            (self.root / (name + ".secret")).write_text(name + "-test-secret")
+            (self.root / (name + ".secret")).write_text(name + "-test-secret-for-synthetic-tests")
             # Environment names differ from Pond names on purpose.
             config += f'''
 [ponds.{name}]
@@ -64,12 +64,12 @@ allowed_roots = ["{self.root}/{name}"]
 control_plane_uid = 1000
 '''
         (self.root / "config.toml").write_text(config)
-        self.settings = Settings.load(self.root / "config.toml")
+        self.settings = runtime_settings(self.root / "config.toml")
         self.provider = SQLiteOAuthProvider("https://server.test", self.settings.oauth_database_file,
                                             self.settings.ponds, dynamic())
         with Transaction(self.settings.oauth_database_file) as db:
-            self.canvas = add_service(db, "canvas", URL, ["alpha", "beta"])
-            self.other = add_service(db, "other", "http://127.0.0.1:18600/mcp", ["alpha"])
+            self.canvas = add_service(db, "canvas", URL, {'alpha': 'writer', 'beta': 'writer'}, roles=["reader", "writer"], default_role="reader")
+            self.other = add_service(db, "other", "http://127.0.0.1:18512/mcp", {'alpha': 'writer'}, roles=["reader", "writer"], default_role="reader")
         self.requests = {"alpha": [], "beta": []}
         self.servers = {}
         for name in self.requests:
@@ -129,14 +129,14 @@ control_plane_uid = 1000
             with self.subTest(authorization=authorization):
                 response = await self.register(authorization)
                 self.assertEqual(response.status_code, 401)
-                self.assertEqual(response.json()["error"]["code"], "forbidden")
+                self.assertEqual(response.json()["code"], "forbidden")
                 response = await self.introspect("x", authorization or "Basic ")
                 self.assertEqual(response.status_code, 401)
-                self.assertEqual(response.json()["error"]["code"], "forbidden")
+                self.assertEqual(response.json()["code"], "forbidden")
         self.assertEqual(self.requests, {"alpha": [], "beta": []})
         response = await self.register(basic(self.canvas["client_id"], self.canvas["client_secret"]), b"{}")
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+        self.assertEqual(response.json()["code"], "invalid_request")
 
     async def test_a_worker_that_is_down_is_still_a_source(self):
         self.servers["beta"].close()
@@ -154,7 +154,7 @@ control_plane_uid = 1000
         response = await self.introspect(token.token)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"active": True, "sub": "alpha", "aud": URL,
-                                           "exp": token.expires_at, "client_id": self.canvas["client_id"]})
+                                           "exp": token.expires_at, "client_id": self.canvas["client_id"], "role": "writer"})
         # Another service cannot use (or learn about) canvas's token.
         response = await self.introspect(token.token, basic(self.other["client_id"], self.other["client_secret"]))
         self.assertEqual(response.json(), {"active": False})
@@ -171,6 +171,15 @@ control_plane_uid = 1000
             "Authorization": basic(self.canvas["client_id"], self.canvas["client_secret"])})
         self.assertEqual(response.status_code, 400)
 
+    async def test_http_introspection_uses_current_role_for_an_existing_token(self):
+        from boring_crocodile.oauth_records import service_grants
+        token = self.provider.mint_service_token("alpha", self.canvas, SERVICE_TOKEN_SECONDS).token
+        self.assertEqual((await self.introspect(token)).json()["role"], "writer")
+        with Transaction(self.settings.oauth_database_file) as db:
+            plan = service_grants(db, "canvas", {"alpha": "reader", "beta": "writer"})
+            service_grants(db, "canvas", plan["after"], plan["plan_digest"])
+        self.assertEqual((await self.introspect(token)).json()["role"], "reader")
+
     async def agent_token(self, client, pond, resource=None):
         resource = resource or f"https://server.test/mcp/{pond}"
         url = await self.provider.authorize(client, AuthorizationParams(
@@ -178,7 +187,7 @@ control_plane_uid = 1000
             redirect_uri=AnyUrl("https://client.test/callback"),
             redirect_uri_provided_explicitly=True, resource=resource))
         request = parse_qs(urlparse(url).query)["request"][0]
-        callback = self.provider.approve(request, pond + "-test-secret", pond)
+        callback = self.provider.approve(request, pond + "-test-secret-for-synthetic-tests", pond)
         code = await self.provider.load_authorization_code(client, parse_qs(urlparse(callback).query)["code"][0])
         return (await self.provider.exchange_authorization_code(client, code)).access_token
 

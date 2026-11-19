@@ -4,23 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "boring-crocodile-mcp"
-version = "0.4.21"
+version = "0.5.0"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE", "COPYING.md"]
 description = "Authenticated MCP access to isolated personal workspaces"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "mcp>=2.2,<2.3",
+    "Pillow>=13,<14",
     "pydantic>=2.13,<3",
     "starlette>=1.6,<2",
     "httpx2>=2.13,<2.14",
-    "boring-deploy>=0.7.11,<0.8",
-    "boring-file-core>=0.7.11,<0.8",
-    "boring-worker-kit>=0.7.11,<0.8",
-    "boring-registry>=0.7.11,<0.8",
-    "boring-service-kit>=0.7.11,<0.8",
-    "tomli>=2.2; python_version < '3.11'",
-    "exceptiongroup>=1.3; python_version < '3.11'",
+    "boring-outcomes>=0.8.0,<0.9",
+    "boring-deploy>=0.8.0,<0.9",
+    "boring-file-core>=0.8.0,<0.9",
+    "boring-worker-kit>=0.8.0,<0.9",
+    "boring-registry>=0.8.0,<0.9",
+    "boring-service-kit>=0.8.0,<0.9",
 ]
 
 [project.scripts]
@@ -37,11 +37,11 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-boring_crocodile = ["templates/*.md", "templates/services/*.in"]
+boring_crocodile = ["handbooks/*.md", "handbooks/*/*.md", "templates/*.md", "templates/services/*.in"]
 
 # Deliberately scoped gate: strict boundary contracts, not a suppressed repo-wide baseline.
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 strict = true
 follow_imports = "silent"
-files = ["src/boring_crocodile/pirate_authority.py", "src/boring_crocodile/pirates.py", "src/boring_crocodile/admin.py", "src/boring_crocodile/control_plane.py", "src/boring_crocodile/outcomes.py", "src/boring_crocodile/settings.py", "src/boring_crocodile/batch.py", "src/boring_crocodile/batch_steps.py"]
+files = ["src/boring_crocodile/pirate_authority.py", "src/boring_crocodile/pirates.py", "src/boring_crocodile/admin.py", "src/boring_crocodile/control_plane.py", "src/boring_crocodile/outcomes.py", "src/boring_crocodile/settings.py", "src/boring_crocodile/batch.py", "src/boring_crocodile/batch_steps.py", "src/boring_crocodile/site_model.py", "src/boring_crocodile/site_templates.py"]

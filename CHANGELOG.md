@@ -3,6 +3,44 @@
 Notable changes per release, newest first ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 [SemVer](https://semver.org/); tags `vX.Y.Z`, candidates `vX.Y.Z-rc.N`).
 
+## 0.5.0 — 2026-11-19
+
+### Upgrading
+
+Update Crocodile and Pirates in the same maintenance window with Pirate
+work stopped. Crocodile 0.5.0 pairs with Pirates 0.4.0 or later in the 0.4
+line. The Linux host needs x86_64, glibc 2.39 or newer and Python 3.12 or
+newer. Common 0.8.0 is bundled.
+
+Published 0.4.21 sites move through the
+[stopped-site adoption](docs/OPERATIONS.md#adopting-a-pre-description-site).
+Take the matching snapshot before conversion. The controller upgrades the
+OAuth store in one transaction and retains clients, credentials and tokens.
+Existing service callers start as readers. The Services check compares its
+legacy list with Crocodile membership and lists differences for explicit
+decisions. Follow the [family update guide](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/updating.md)
+before restoring writer roles. To go back across adoption, use the
+[matching snapshot](docs/OPERATIONS.md#way-back-across-adoption).
+
+Pond approval files need at least 24 characters after trimming whitespace.
+Check existing files before starting the update. See
+[checking and generating a secret](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/CHANGELOG.md#upgrading).
+The rendered bind policy protects the controller and registered loopback
+service ports from Pond commands and from Pirate serving and command
+processes. Reserve 18530–18539 for tunnels. Add any custom local service port
+to `server.protected_ports` and apply the site render before using it.
+
+### Changes
+
+- One site description owns Pond workers, their resource limits and Pirate
+  admission. Review the render plan and use site-check to see effective
+  differences and the paths of invalid description files.
+- Service registration grants each caller a reader or writer role.
+  Provisioning and administrative changes show plans for review.
+- The packaged handbooks cover getting started and operating a site together.
+  The Crocodile reports its installed release and can read JPEG, PNG and WebP
+  images. Job and service failures use the family's shared outcome format.
+
 ## 0.4.21 — 2026-11-08
 
 0.4.20 on Pond Common 0.7.13, plus documentation fixes (install blocks, release prerequisites, a picture of the whole).
