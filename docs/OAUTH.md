@@ -2,7 +2,7 @@
 
 The controller signs clients in with OAuth (the Common issuer,
 `boring_service_kit.issuer`, with the Ponds as targets) and keeps everything
-in one SQLite store, `/var/lib/boring-crocodile/oauth.sqlite3` (schema 5):
+in one SQLite store, `/var/lib/boring-crocodile/oauth.sqlite3` (schema 6):
 clients, agent grants and the admin-added services. Code:
 `sqlite_oauth_provider.py`, storage contract `oauth_records.py`. Commands:
 [ADMIN](ADMIN.md).
@@ -29,8 +29,9 @@ on any port (RFC 8252). The approval page shows the redirect host first and
 how the client is known, and warns when it registered itself or redirects
 only to loopback.
 
-Then the person enters the Pond's approval secret. Five wrong secrets cancel
-that sign-in (counted in the controller's memory).
+Then the person enters the Pond's approval secret. Five wrong tries cancel
+that one sign-in. The secret's length protects against guessing. Provisioning
+and render require at least 24 characters. Keep the generated random secret.
 
 ## Lifetimes and binding
 
@@ -39,7 +40,8 @@ that sign-in (counted in the controller's memory).
 | pending approval, authorization code | 300 s |
 | access token | 3600 s |
 | refresh token | 14 days |
-| service-call token (minted for one Pond and service) | 3600 s, renewed below 900 s left |
+| Pond service-call token (minted for one Pond and service) | 3600 s, renewed below 900 s left |
+| Pirate service-call token (minted through its local authority) | 60 s, obtained for each call |
 
 Each token is bound to the resource it was issued for: one `/mcp/POND`, or a
 service's URL. An authorization request for any other resource, or for none,
@@ -63,9 +65,20 @@ backups, out of Git, logs and Pond-readable places.
 
 ## Schema and backup
 
-An empty store starts at schema 5, the only schema this release reads. Any
-other schema, an unversioned or a corrupt store refuses to start, unchanged;
-there is no in-memory fallback.
+An empty store starts at schema 6. On startup, the store owner upgrades
+schema 5 to 6 in one transaction: existing services declare reader/writer
+roles with reader as default, and every existing member becomes reader.
+Clients, service credentials and tokens are preserved unchanged. A failed or
+interrupted upgrade leaves schema 5 intact. Any other schema, an unversioned
+or a corrupt store refuses to start unchanged; there is no in-memory fallback.
+
+Service records carry their declared roles/default and caller-to-role map.
+Introspection reads the current role, so changing it needs no new bearer.
+The Services check prints a preview and an apply command with the complete
+caller map from the old access list. Run the preview, review the roles, run
+the command with `--apply` and type `APPLY`. Decide any custom author aliases
+before replacing the old access block. Check that the intended reader can
+read and the intended writer can perform a harmless write.
 
 A release that changes the schema says so, and its deploy backs the store up
 before switching (asked, or `--backup`). By hand, at any time, with the admin
@@ -74,6 +87,8 @@ command of the release installed now:
     sudo boring-crocodile-admin oauth backup --output /root/oauth-before-VERSION.sqlite3
 
 It uses SQLite's backup, refuses an existing file and checks integrity.
+The candidate admin can back up schema 5 read-only before startup upgrades it;
+backup never upgrades the source. Across 6 -> 5, restore the matching snapshot.
 
 ## Restore
 

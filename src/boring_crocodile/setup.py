@@ -1,9 +1,8 @@
-"""Shared wizard/unattended planning; privileged apply requires explicit intent."""
+"""Shared wizard/file planning; privileged apply requires typed confirmation."""
 from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
-import grp
 import hashlib
 from importlib.resources import files as resource_files
 import json
@@ -13,44 +12,28 @@ import pwd
 import re
 import sys
 import subprocess
-from .site_layout import CONFIG_FILE
 
-NAME = re.compile(r"[a-z_][a-z0-9_-]{0,30}")
-HOME_PART = re.compile(r"[A-Za-z0-9_-]+")
-RESERVED_HOME_PARENTS = {"bin", "boot", "dev", "etc", "lib", "lib64",
-                         "proc", "root", "run", "sbin", "sys", "tmp", "usr", "var"}
+from boring_deploy import Failure, root_child, root_input
+
+from .site_layout import CONFIG_FILE
+from .site_host import account as account, group as group
+from .approval import confirm_apply, plan_digest as plan_digest
+
+from .site_model import check_account_name as check_account_name, validate_home as validate_home
+
 FIELDS = {"execution_user", "control_user", "home",
           "context_mode", "context_source", "context_files"}
-# Optional: the name people see for the Pond (the sign-in page, pond_ping and
-# pond_profile). Without it: "The Pond" for the first Pond, else its name.
+# Optional: the name people see for the Pond on the sign-in page.
+# Without it: "The Pond" for the first Pond, else its name.
 OPTIONAL_FIELDS = {"display_name"}
 DISPLAY_NAME = re.compile(r"[^\x00-\x1f\x7f]{1,64}")
-
-def validate_home(home, execution_user):
-    """A dedicated leaf under a protected host-owned parent."""
-    if (not isinstance(home, str) or not home.startswith("/")
-            or str(Path(home)) != home or any(part in ("", ".", "..") for part in home.split("/")[1:])
-            or len(Path(home).parts) < 3 or len(Path(home).parts) > 8
-            or any(not HOME_PART.fullmatch(part) for part in Path(home).parts[1:])
-            or Path(home).parts[1] in RESERVED_HOME_PARENTS
-            or Path(home).name != execution_user):
-        raise ValueError(f"The home must be an absolute path ending in /{execution_user}, two to seven "
-                         "folders deep, under a parent like /home or /srv (not /etc, /root, /tmp, /usr, "
-                         "/var or another system folder)")
-    return home
-
-def check_account_name(name, key="account"):
-    if not isinstance(name, str) or not NAME.fullmatch(name):
-        raise ValueError(key + " must be a Unix account name: lower-case letters, digits, '-' and '_', "
-                         "starting with a letter or '_', at most 31 characters")
-    if name in {"root", "nobody", "nogroup"}:
-        raise ValueError(key + " is reserved: " + name)
-    return name
+HANDBOOKS = ("starter", "engineer", "consultant")
 
 
 def default_home(execution_user, runner=subprocess.run):
     """Read the default base from the account tool we actually use."""
-    result = runner(["/usr/sbin/useradd", "-D"], check=True, capture_output=True, text=True)
+    result = root_child(["/usr/sbin/useradd", "-D"], spawn=runner,
+                        check=True, capture_output=True, text=True)
     defaults = [line[5:] for line in result.stdout.splitlines() if line.startswith("HOME=")]
     if len(defaults) != 1:
         raise ValueError("Cannot determine useradd home base; enter the execution home explicitly")
@@ -88,8 +71,8 @@ class SetupInputs:
         validate_home(home, data["execution_user"])
         mode = data["context_mode"]
         files = data["context_files"]
-        if mode not in ("starter", "import"):
-            raise ValueError("context_mode must be starter or import")
+        if mode not in (*HANDBOOKS, "import"):
+            raise ValueError("context_mode must be starter, engineer, consultant or import")
         if not isinstance(files, list) or any(not isinstance(f, str) or not f for f in files):
             raise ValueError("context_files must be a list of relative filenames")
         if len(set(files)) != len(files):
@@ -98,9 +81,9 @@ class SetupInputs:
             if Path(f).is_absolute() or ".." in Path(f).parts or str(Path(f)) != f or f == ".":
                 raise ValueError("Context filenames must be normalized relative paths")
         source = data["context_source"]
-        if mode == "starter":
+        if mode in HANDBOOKS:
             if source is not None or files:
-                raise ValueError("Starter mode accepts no import source or files")
+                raise ValueError("Packaged handbooks accept no import source or files")
         elif not isinstance(source, str) or not Path(source).is_absolute() or ".." in Path(source).parts or not files:
             raise ValueError("Import needs an absolute source directory and an explicit nonempty file list")
         return cls(data["execution_user"], data["control_user"],
@@ -109,120 +92,44 @@ class SetupInputs:
     def as_input(self):
         value = asdict(self)
         value["context_files"] = list(self.context_files)
-        if self.display_name is None:  # receipts written before the field match unchanged
+        if self.display_name is None:
             del value["display_name"]
         return value
 
 
-def account(name):
-    try:
-        value = pwd.getpwnam(name)
-    except KeyError:
-        return None
-    return {"name": value.pw_name, "uid": value.pw_uid, "gid": value.pw_gid,
-            "home": value.pw_dir, "shell": value.pw_shell}
-
-
-def group(name):
-    try:
-        value = grp.getgrnam(name)
-    except KeyError:
-        return None
-    return {"name": value.gr_name, "gid": value.gr_gid}
-
-
-def context_payload(inputs):
-    if inputs.context_mode == "starter":
-        raw = resource_files("boring_crocodile").joinpath("templates/HANDBOOK.md").read_bytes()
-        from .instructions import WELCOME
-        return [("HANDBOOK.md", raw), ("WELCOME.md", WELCOME.encode())]
-    root = Path(inputs.context_source).resolve(strict=True)
-    if not root.is_dir():
-        raise ValueError("Context source must be a directory")
+def context_payload(inputs, *, metadata=None):
+    if inputs.context_mode in HANDBOOKS:
+        root = resource_files("boring_crocodile").joinpath("handbooks", inputs.context_mode)
+        payload = [(name, root.joinpath(name).read_bytes()) for name in ("HANDBOOK.md", "WELCOME.md")]
+        shared = resource_files("boring_crocodile").joinpath("handbooks", "OPERATING_TOGETHER.md")
+        return [*payload, ("OPERATING_TOGETHER.md", shared.read_bytes())]
+    root = Path(inputs.context_source)
     result = []
     if len(inputs.context_files) > 64:
         raise ValueError("At most 64 initial context files")
-    for name in inputs.context_files:
-        path = (root / name).resolve(strict=True)
-        if root not in path.parents or not path.is_file():
-            raise ValueError("Context import escapes source or is not a regular file")
-        with path.open("rb") as stream:
-            raw = stream.read(1024 * 1024 + 1)
-        if len(raw) > 1024 * 1024:
-            raise ValueError("Initial context document exceeds 1 MiB")
-        raw.decode("utf-8")
-        result.append((name, raw))
+    with root_input(root, directory=True) as folder:
+        if metadata is not None:
+            metadata.extend(folder.describe())
+        for name in inputs.context_files:
+            with root_input(root / name) as source:
+                # Bound the read on the admitted descriptor, never reopen its name.
+                with os.fdopen(os.dup(source.fd), "rb") as stream:
+                    raw = stream.read(1024 * 1024 + 1)
+                if len(raw) > 1024 * 1024:
+                    raise ValueError("Initial context document exceeds 1 MiB")
+                raw.decode("utf-8")
+                result.append((name, raw))
+                if metadata is not None:
+                    metadata.extend(row for row in source.describe() if row not in metadata)
     if "WELCOME.md" not in inputs.context_files:
         from .instructions import WELCOME
         result.append(("WELCOME.md", WELCOME.encode()))
     return result
 
 
-def plan_digest(plan):
-    value = {k: v for k, v in plan.items() if k != "plan_digest"}
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def inspect(inputs, config_path=CONFIG_FILE):
-    review = []
-    accounts = {}
-    for role, name in (("execution", inputs.execution_user), ("control", inputs.control_user)):
-        current = account(name)
-        accounts[role] = {"requested_name": name, "current": current,
-                          "action": "review_existing" if current else "create"}
-        if current:
-            review.append(f"The account {name} already exists; setup never takes over an existing account")
-    groups = {}
-    for name in (inputs.execution_user, inputs.control_user):
-        current = group(name)
-        groups[name] = {"current": current, "action": "review_existing" if current else "create"}
-        if current:
-            review.append(f"The group {name} already exists; setup never takes over an existing group")
-    home = Path(inputs.home)
-    # lexists also detects dangling symlinks; never reinterpret these as absent.
-    for path in (config_path, home, home / "handbook"):
-        if os.path.lexists(path):
-            review.append(f"{path} already exists; setup never writes over it")
-    for path in (home, *home.parents):
-        if path.is_symlink():
-            review.append(f"{path} is a symlink; the home's path must not contain one")
-    parent = home.parent
-    if not parent.is_dir():
-        review.append(f"The folder {parent} does not exist; create it first (owned by root, "
-                      "writable by root only)")
-    else:
-        for path in (parent, *parent.parents):
-            info = path.lstat()
-            if info.st_uid != 0 or info.st_mode & 0o022:
-                review.append(f"{path} must belong to root and be writable by root only")
-                break
-    documents = [{"filename": name, "sha256": hashlib.sha256(raw).hexdigest(),
-                  "bytes": len(raw)} for name, raw in context_payload(inputs)]
-    return {
-        "schema_version": 1,
-        "stage": "plan_only",
-        "status": "review_required" if review else "proposed",
-        "inputs": inputs.as_input(),
-        "accounts": accounts,
-        "groups": groups,
-        "memberships": [
-            {"user": inputs.control_user, "group": inputs.execution_user},
-        ],
-        "directories": [
-            {"path": inputs.home, "owner": inputs.execution_user, "mode": "0700"},
-            {"path": str(home / "handbook"), "owner": inputs.execution_user, "mode": "0700"},
-            {"path": str(home / "work"), "owner": inputs.execution_user, "mode": "0700"},
-            {"path": str(home / "lab"), "owner": inputs.execution_user, "mode": "0700"},
-        ],
-        "context": {"mode": inputs.context_mode, "documents": documents,
-                    "starter": "HANDBOOK.md" if inputs.context_mode == "starter" else None,
-                    "overwrite_existing": False, "publish_automatically": False},
-        "review": review,
-        "pending": ["Apply checks the host again before it creates anything",
-                    "The handbook files are written as the Pond's account",
-                    "Then the site: services, the approval secret, a health check"],
-    }
-
+    from .setup_apply import plan
+    return plan(inputs, config_path=config_path)
 
 def wizard(ask=input, tell=None, *, pond=None, controller=None):
     """The same answers as a setup file, asked one by one; each answer is
@@ -287,12 +194,12 @@ def wizard(ask=input, tell=None, *, pond=None, controller=None):
 
     home = field("The Pond's home", proposed_home, safe_home)
     shown = field("The name people see on sign-in", pond or "The Pond", display)
-    def starter_or_import(value):
-        if value not in ("starter", "import"):
-            raise ValueError("Answer starter or import")
+    def handbook(value):
+        if value not in (*HANDBOOKS, "import"):
+            raise ValueError("Answer starter, engineer, consultant or import")
 
-    mode = field("Handbook: the packaged starter, or import your own files (starter/import)",
-                 "starter", starter_or_import)
+    mode = field("Handbook: starter, engineer (code/systems), consultant (research), or import",
+                 "starter", handbook)
     source, files = None, []
     if mode == "import":
         source = field("Folder to import from", check=directory)
@@ -322,22 +229,9 @@ def terminal_ask(prompt):
     return input()
 
 
-def site_controller(config=CONFIG_FILE, receipt=Path("/etc/boring-crocodile/initial-setup.json")):
-    """The Crocodile's account of an existing site, for --add-pond; None if unknown."""
-    try:
-        if Path(config).exists():
-            try:
-                import tomllib
-            except ImportError:  # Python 3.10
-                import tomli as tomllib
-            environments = tomllib.loads(Path(config).read_text()).get("environments", {})
-            uids = {value.get("control_plane_uid") for value in environments.values()}
-            if len(uids) == 1 and None not in uids:
-                return pwd.getpwuid(uids.pop()).pw_name
-        return json.loads(Path(receipt).read_text())["inputs"]["control_user"]
-    except (OSError, KeyError, ValueError, TypeError):
-        return None
-
+def site_controller(config=CONFIG_FILE):
+    from .site_model import SiteDescription
+    return SiteDescription.read(Path(config)).controller.name
 
 def unique_object(pairs):
     result = {}
@@ -346,6 +240,14 @@ def unique_object(pairs):
             raise ValueError("Duplicate JSON key: " + key)
         result[key] = value
     return result
+
+
+def read_input_json(path):
+    """Read proposed setup JSON once through Common's protected-input boundary."""
+    with root_input(Path(path).absolute()) as source:
+        data = json.loads(source.read_text(), object_pairs_hook=unique_object)
+        print("\n".join(source.describe()), file=sys.stderr)
+        return data
 
 
 def save_inputs(path, inputs):
@@ -357,80 +259,57 @@ def save_inputs(path, inputs):
 
 
 def review_summary(plan):
-    inputs = plan["inputs"]
-    names = ", ".join(item["filename"] for item in plan["context"]["documents"])
-    source = ("the packaged starter" if inputs["context_mode"] == "starter"
-              else "imported from " + str(inputs["context_source"]))
-    lines = [f"The Pond's account: {inputs['execution_user']}. Commands and files run as it.",
-             f"The Crocodile's account: {inputs['control_user']}, joining the group {inputs['execution_user']}.",
-             f"Home: {inputs['home']}, with handbook/, work/ and lab/.",
-             f"Handbook: {source} ({names}).",
-             "Name people see: " + inputs.get("display_name", plan.get("pond_name") or "The Pond") + ".",
-             "Nothing starts yet; the site is the next step."]
-    if plan["review"]:
-        lines += ["", "Setup cannot go on:"] + ["  - " + item for item in plan["review"]]
-    return "\n".join(lines)
-
+    names = ", ".join(item["filename"] for item in plan["documents"])
+    return (f"Provision Pond {plan['pond']}: {plan['inputs']['execution_user']} and "
+            f"controller {plan['inputs']['control_user']}.\n"
+            f"Seed missing handbook files: {names}. Existing files and secrets are kept.\n"
+            "Description access: main config to controller/all Ponds; each Pond file to its worker/controller only.\n"
+            "The declaration stays parked; provisioning starts nothing.\n"
+            + "\n".join(plan.get("operator_inputs", [])))
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Plan initial accounts/context, or explicitly apply on a clean target.",
+    parser = argparse.ArgumentParser(description="Plan Pond provisioning or site configuration; apply after typed confirmation.",
                                      allow_abbrev=False)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--wizard", action="store_true")
     mode.add_argument("--site-wizard", action="store_true",
-                      help="Configure local services after account/context setup")
+                      help="Configure the controller, listener and service policy after provisioning")
     mode.add_argument("--site-config", type=Path,
-                      help="Unattended service policy JSON after account/context setup")
-    mode.add_argument("--config", type=Path, help="Unattended JSON input; no prompts")
+                      help="Site policy JSON after provisioning")
+    mode.add_argument("--config", type=Path, help="JSON inputs; --apply still requires typed confirmation")
     mode.add_argument("--site-extend", action="store_true",
-                      help="Bring Ponds created with --add-pond into the running site (site-check first)")
+                      help="Enable explicitly named Ponds through the common site render")
     mode.add_argument("--site-render", action="store_true",
-                      help="Write the site's units and tmpfiles as this release renders them; with --guests, "
-                           "let running Ponds accept guests (site-check first)")
-    parser.add_argument("--guests", metavar="PONDS", help="with --site-render: Ponds that start accepting guests")
+                      help="Reconcile the desired site and run its repair tail")
     parser.add_argument("--add-pond", metavar="NAME", help="Create a new Pond's accounts and home for the site's controller; then --site-extend")
     parser.add_argument("--save-inputs", type=Path, help="Create a reusable input file without overwriting")
-    parser.add_argument("--apply", action="store_true", help="Root-only initial account/context provisioning")
-    parser.add_argument("--approve-digest", help="Digest from an explicitly reviewed plan")
-    parser.add_argument("--resume", action="store_true", help="Resume recorded initial setup; requires --apply")
+    parser.add_argument("--apply", action="store_true", help="Apply the selected operation as root after reviewing its plan")
     parser.add_argument("--grant-services", metavar="NAMES",
                         help="with --site-extend: 'all' or comma-separated services the new Pond may call")
     for flag, text in (("--memory", "memory ceiling per new Pond, e.g. 2G"),
                        ("--swap", "swap ceiling per new Pond, e.g. 512M"),
                        ("--tasks", "process/thread ceiling per new Pond"),
-                       ("--bring-back", "comma-separated parked Ponds to take into the site again")):
+                       ("--bring-back", "explicit Ponds to enable or repair, comma-separated; omission selects none")):
         parser.add_argument(flag, help="with --site-extend: " + text)
     args = parser.parse_args(argv)
-    if args.resume and not args.apply:
-        parser.error("--resume requires --apply")
-    if args.approve_digest and not args.apply:
-        parser.error("--approve-digest requires --apply")
-    if args.apply and args.config and not args.approve_digest:
-        parser.error("Unattended apply requires --approve-digest")
 
     extend_only = [("--grant-services", args.grant_services), ("--memory", args.memory),
                    ("--swap", args.swap), ("--tasks", args.tasks), ("--bring-back", args.bring_back)]
     if not args.site_extend and any(value for _, value in extend_only):
         parser.error("--grant-services, --memory, --swap, --tasks and --bring-back belong to --site-extend")
-    if args.guests and not args.site_render:
-        parser.error("--guests belongs to --site-render")
     if args.site_render:
-        if args.add_pond or args.save_inputs or args.resume or any(value for _, value in extend_only):
-            parser.error("--site-render takes only --guests, --apply and --approve-digest")
+        if args.add_pond or args.save_inputs or any(value for _, value in extend_only):
+            parser.error("--site-render takes only --apply")
         from .site_render import main as render_site_files
-        forwarded = (["--guests", args.guests] if args.guests else []) + (["--apply"] if args.apply else [])
-        if args.approve_digest:
-            forwarded += ["--approve-digest", args.approve_digest]
+        forwarded = ["--apply"] if args.apply else []
         return render_site_files(forwarded)
     if args.site_extend:
-        if args.add_pond or args.save_inputs or args.resume:
+        if args.add_pond or args.save_inputs:
             parser.error("--site-extend does not accept account setup options")
         from .site_extend import main as extend_site
         forwarded = [item for flag, value in extend_only if value for item in (flag, value)]
         if args.apply:
             forwarded.append("--apply")
-        if args.approve_digest:
-            forwarded += ["--approve-digest", args.approve_digest]
         return extend_site(forwarded)
 
     if args.site_wizard or args.site_config:
@@ -441,21 +320,17 @@ def main(argv=None):
                      else ["--config", str(args.site_config)])
         if args.apply:
             forwarded.append("--apply")
-        if args.approve_digest:
-            forwarded += ["--approve-digest", args.approve_digest]
-        if args.resume:
-            forwarded.append("--resume")
         return configure_site(forwarded)
 
     try:
         if args.wizard:
             if not sys.stdin.isatty():
-                raise ValueError("--wizard requires a terminal; use --config for unattended operation")
+                raise ValueError("--wizard requires a terminal; use --config to read inputs from a file")
             print("Account/context setup. Existing data will not be overwritten.", file=sys.stderr)
             inputs = wizard(terminal_ask, pond=args.add_pond,
                             controller=site_controller() if args.add_pond else None)
         else:
-            inputs = SetupInputs.parse(json.loads(args.config.read_text(), object_pairs_hook=unique_object))
+            inputs = SetupInputs.parse(read_input_json(args.config))
         if args.add_pond:
             from .setup_apply import plan_additional
             result = plan_additional(inputs, args.add_pond)
@@ -466,34 +341,30 @@ def main(argv=None):
         result["plan_digest"] = plan_digest(result)
         if args.apply:
             from .setup_apply import apply
-            digest = args.approve_digest
-            if args.wizard and not digest:
+            if args.wizard:
                 print("\n" + review_summary(result) + "\n", file=sys.stderr)
-                if result["review"]:
-                    print("Nothing was changed. Settle these, then run the wizard again.", file=sys.stderr)
-                    return 3
-                print("Type APPLY to create these accounts and the home: ",
-                      file=sys.stderr, end="", flush=True)
-                if sys.stdin.readline().strip() != "APPLY":
-                    raise ValueError("Apply was not confirmed")
-                digest = result["plan_digest"]
+            if result["review"]:
+                print(json.dumps(result, indent=2), file=sys.stderr)
+                print("Nothing was changed. Settle these, then run setup again.", file=sys.stderr)
+                return 3
+            digest = confirm_apply(result, "create these accounts and the home")
             if args.add_pond:
                 from .setup_apply import apply_additional
-                outcome = apply_additional(inputs, args.add_pond, digest, resume=args.resume)
+                outcome = apply_additional(inputs, args.add_pond, digest)
             else:
-                outcome = apply(inputs, digest, resume=args.resume)
+                outcome = apply(inputs, digest)
             if args.wizard:
                 print("Done: the accounts and the home are in place; nothing runs yet.", file=sys.stderr)
-                print("Next: " + ("boring-crocodile-setup --site-extend --apply" if args.add_pond else
-                                  "boring-crocodile-setup --site-wizard --apply, or --site-config FILE "
-                                  "for a site that will take Pirates (INSTALL, Activate the site)."),
+                print("Next: " + ("boring-crocodile-setup --site-extend --bring-back " + args.add_pond + " --apply" if args.add_pond else
+                                  "boring-crocodile-setup --site-wizard --apply, or --site-config FILE --apply; "
+                                  "configure the controller, listener and service policy."),
                       file=sys.stderr)
             else:
                 print(json.dumps(outcome, indent=2))
             return 0
         print(json.dumps(result, indent=2))
         return 3 if result["review"] else 0
-    except (ValueError, OSError, EOFError, subprocess.SubprocessError) as error:
+    except (Failure, ValueError, OSError, EOFError, subprocess.SubprocessError) as error:
         print("Setup failed: " + str(error), file=sys.stderr)
         return 2
 

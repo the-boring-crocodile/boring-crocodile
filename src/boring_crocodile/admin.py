@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import OrderedDict
+from collections.abc import Mapping
 import fcntl
+import grp
 import json
 import os
 import pwd
@@ -16,15 +18,19 @@ import struct
 import sys
 from typing import TYPE_CHECKING, Any, BinaryIO, Callable, Literal, Protocol
 
+from boring_deploy import root_child
 from boring_worker_kit.observation import MAX_EVENT_BYTES, protected_directory, watch_path
 from .settings import EnvironmentSettings, Settings
-from .site_layout import CONFIG_FILE
+from .site_layout import CONFIG_FILE, site_lock
+from .approval import confirm_apply
 from .watch_views import VIEWS
 from boring_worker_kit.host_limits import read_host_limits
 from .task_policy import inspect_task_policy
 
 if TYPE_CHECKING:
     from .oauth_admin import OAuthAdmin
+    from .site_model import Identity
+    from .site_render import ServicePortReport
 
 
 def execution_identity(environment: EnvironmentSettings) -> tuple[int, int]:
@@ -222,19 +228,20 @@ def describe(settings: Settings, name: str) -> dict[str, object]:
 
 class StatusRunner(Protocol):
     def __call__(self, command: list[str], /, *, capture_output: bool, text: Literal[True],
-                 check: bool, timeout: int | None = None) -> subprocess.CompletedProcess[str]: ...
+                 check: bool, timeout: float | None = None,
+                 cwd: str = "/", env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]: ...
 
 
 def unit_state(unit: str, runner: StatusRunner = subprocess.run, *,
                socket_capacity: bool = False) -> dict[str, str | int | None]:
     """Ask systemd for coarse state; systemd remains the state owner."""
     try:
-        result = runner(
+        result = root_child(
             ["/usr/bin/systemctl", "show", "--no-pager",
              "--property=LoadState", "--property=ActiveState",
              "--property=SubState",
              *(["--property=MaxConnections"] if socket_capacity else []), unit],
-            capture_output=True, text=True, check=False, timeout=5,
+            spawn=runner, capture_output=True, text=True, check=False, timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         return {"unit": unit, "load": "unknown", "active": "unknown",
@@ -282,11 +289,7 @@ def status_report(settings: Settings, pond: str | None = None,
                   runner: StatusRunner = subprocess.run,
                   site_reader: Callable[[], dict[str, Any]] | None = None,
                   ) -> dict[str, object]:
-    names = tuple(settings.ponds)
-    if pond is not None:
-        if pond not in names:
-            raise ValueError("Unknown Pond: " + pond)
-        names = (pond,)
+    report = runtime_status(settings, pond, runner)
     if site_reader is None:
         from .site_check import site_check
         site_reader = site_check
@@ -296,7 +299,19 @@ def status_report(settings: Settings, pond: str | None = None,
                                         "irregular": [item["what"] for item in site["irregular"]][:10]}
     except (OSError, ValueError, KeyError) as error:
         site_view = {"status": "unknown", "error": f"{type(error).__name__}: {error}"}
+    # Informational: generated-file differences are separate from runtime health.
+    return {**report, "site_check": site_view}
 
+
+def runtime_status(settings: Settings, pond: str | None = None,
+                   runner: StatusRunner = subprocess.run, *,
+                   identities: Mapping[str, Identity] | None = None) -> dict[str, object]:
+    """One runtime inspection owner, shared by status and render readiness."""
+    names = tuple(settings.ponds)
+    if pond is not None:
+        if pond not in names:
+            raise ValueError("Unknown Pond: " + pond)
+        names = (pond,)
     target = unit_state("boring-crocodile-mcp.target", runner)
     controller = unit_state("boring-crocodile-mcp.service", runner)
     site_units_healthy = all(
@@ -326,8 +341,14 @@ def status_report(settings: Settings, pond: str | None = None,
             },
         }
         enabled = getattr(env, "command_execution_enabled", True)
+
+        def inspect_output(command: list[str], *, timeout: float = 8) -> str:
+            result: subprocess.CompletedProcess[str] = root_child(
+                command, spawn=runner, check=True, capture_output=True, text=True, timeout=timeout)
+            return result.stdout.strip()
+
         try:
-            limits = read_host_limits(env) if enabled else None
+            limits = read_host_limits(env, run=inspect_output) if enabled else None
             limit_error = None
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             limits = None
@@ -335,11 +356,8 @@ def status_report(settings: Settings, pond: str | None = None,
         authority: dict[str, object] = {"configured_no_new_privileges": getattr(env, "no_new_privileges", True),
                      "loaded_policy": "not_applicable", "sudo_behavior": "not_tested"}
         if enabled:
-            def policy_run(command: list[str]) -> str:
-                return runner(command, check=True, capture_output=True, text=True,
-                              timeout=8).stdout.strip()
             try:
-                authority = inspect_task_policy(env, policy_run)
+                authority = inspect_task_policy(env, inspect_output)
             except (OSError, ValueError, subprocess.SubprocessError):
                 authority["loaded_policy"] = "unknown"
         checks = {
@@ -359,6 +377,28 @@ def status_report(settings: Settings, pond: str | None = None,
             "approval_credential_loaded": (
                 controller["load"] == "loaded" and controller["active"] == "active"),
         }
+        from .pirates import REGISTRATION_GROUP, registration_path
+        paths["registration_socket"] = path_state(registration_path(env.name))
+        checks["registration_socket_present"] = paths["registration_socket"]["kind"] == "socket"
+        if identities is not None:
+            observed = paths["registration_socket"]
+            try:
+                registration_gid = grp.getgrnam(REGISTRATION_GROUP).gr_gid
+            except KeyError:
+                registration_gid = None
+            checks["registration_socket_identity"] = (
+                tuple(observed.get(field) for field in ("uid", "gid", "mode"))
+                == (identities[name].uid, registration_gid, "0660"))
+        if identities is not None:
+            identity = identities[name]
+            for key, mode in (("worker_socket", "0660"), ("task_socket", "0600")):
+                if key == "task_socket" and not enabled:
+                    continue
+                observed = paths[key]
+                checks[key+"_identity"] = (
+                    observed["kind"] == "socket"
+                    and tuple(observed.get(field) for field in ("uid", "gid", "mode"))
+                    == (identity.uid, identity.gid, mode))
         rows.append({
             **describe(settings, name),
             "limits": limits.public() if limits is not None else None,
@@ -375,30 +415,15 @@ def status_report(settings: Settings, pond: str | None = None,
     return {
         "status": "healthy" if healthy else "degraded",
         "site": {"target": target, "controller": controller},
-        # Informational: site-check says what changing commands would stop on.
-        "site_check": site_view,
         "ponds": rows,
     }
 
 
 
-def protected_task_config(path: Path | None) -> Path:
-    """A worker must not be able to choose its own root-applied authority."""
-    path = path or Path(os.environ.get("BORING_CROCODILE_CONFIG", str(CONFIG_FILE)))
-    for item, directory in ((path.parent, True), (path, False)):
-        info = item.lstat()
-        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022 or (
-            not stat.S_ISDIR(info.st_mode) if directory else
-            not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-        ):
-            raise ValueError("task policy requires root-owned protected config")
-    return path
-
-
 def oauth_store(settings: Settings) -> "OAuthAdmin":
     from .oauth_admin import OAuthAdmin
     # Check the installed controller identity, not a user-supplied UID.
-    result = subprocess.run(["/usr/bin/systemctl", "show", "--no-pager",
+    result = root_child(["/usr/bin/systemctl", "show", "--no-pager",
         "-P", "User", "boring-crocodile-mcp.service"], check=True,
         capture_output=True, text=True, timeout=5)
     controller = result.stdout.strip()
@@ -411,7 +436,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
     commands = parser.add_subparsers(dest="action", required=True)
-    commands.add_parser("list")
+    listing = commands.add_parser("list")
+    listing.add_argument("--json", action="store_true",
+                         help="installer inventory: enabled Pond names and admitted Pirate name-to-UID bindings")
     commands.add_parser("pirate-add", help="root-only: admit a Pirate to the running site (plan, then --apply)")
     commands.add_parser("pirate-remove", help="root-only: take a Pirate out of the running site (plan, then --apply)")
     site_check = commands.add_parser(
@@ -430,10 +457,6 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--view", choices=tuple(VIEWS), default="compact",
                              help="human-readable presentation (default: compact)")
             sub.add_argument("--no-color", action="store_true", help="plain terminal output")
-    policy = commands.add_parser("task-policy", help="review per-Pond task authority")
-    policy.add_argument("--pond", required=True)
-    policy.add_argument("--apply", action="store_true")
-    policy.add_argument("--approve-digest")
     oauth = commands.add_parser("oauth", help="root-only OAuth inspection and maintenance")
     oauth_commands = oauth.add_subparsers(dest="oauth_action", required=True)
     oauth_status = oauth_commands.add_parser("status")
@@ -446,7 +469,6 @@ def build_parser() -> argparse.ArgumentParser:
     oauth_scope.add_argument("--client")
     oauth_scope.add_argument("--all-clients", action="store_true")
     oauth_revoke.add_argument("--apply", action="store_true")
-    oauth_revoke.add_argument("--approve-digest")
     oauth_commands.add_parser("clients", help="every client: origin, state, redirect hosts, live grants")
     client_add = oauth_commands.add_parser("client-add", help="pre-register a client (VS Code, Copilot Studio)")
     client_add.add_argument("--name", required=True)
@@ -455,34 +477,38 @@ def build_parser() -> argparse.ArgumentParser:
     client_remove = oauth_commands.add_parser("client-remove", help="a client and all its grants")
     client_remove.add_argument("client_id")
     client_remove.add_argument("--apply", action="store_true")
-    client_remove.add_argument("--approve-digest", help="the plan digest, required with --apply")
     client_prune = oauth_commands.add_parser("client-prune", help="clients idle this long without a refresh token")
     client_prune.add_argument("--idle-days", type=float, default=90)
     client_prune.add_argument("--apply", action="store_true")
-    client_prune.add_argument("--approve-digest", help="the plan digest, required with --apply")
     oauth_backup = oauth_commands.add_parser("backup")
     oauth_backup.add_argument("--output", required=True, type=Path)
+    commands.add_parser("service-ports", help="root-only: show rendered protected loopback service ports")
     service_add = commands.add_parser(
         "service-add", help="root-only: create service credentials, URL and explicit caller grants")
     service_add.add_argument("name")
     service_add.add_argument("--url", required=True, help="the service's MCP endpoint")
-    service_add.add_argument("--ponds", required=True, help="comma-separated configured Pond or pirate/name callers")
+    service_add.add_argument("--apply", action="store_true")
+    service_add.add_argument("--callers", required=True, metavar="NAME=ROLE", help="comma-separated caller roles")
+    service_add.add_argument("--roles", required=True,
+                             help="comma-separated service role names (family kit: reader and writer)")
+    service_add.add_argument("--default-role", required=True, help="the service-declared default role")
+    service_add.add_argument("--ponds", type=_removed_service_ponds, help=argparse.SUPPRESS)
     service_add.add_argument("--ping-timeout", type=float,
                              help="seconds a worker waits for the heartbeat (default 1; "
                                   "more for a service on another host, at most 2.5)")
     service_grants = commands.add_parser("service-grants", help="root-only: review/change callers without credential rotation")
     service_grants.add_argument("name")
-    service_grants.add_argument("--callers", required=True, help="complete comma-separated caller set; preserve intended existing callers")
+    service_grants.add_argument("--callers", required=True, metavar="NAME=ROLE",
+                                help="complete comma-separated caller roles; empty grants nobody")
     service_grants.add_argument("--apply", action="store_true")
-    service_grants.add_argument("--approve-digest", help="reviewed plan digest required with --apply")
     service_endpoint = commands.add_parser("service-endpoint", help="root-only: review/change audience URL without credential rotation")
     service_endpoint.add_argument("name")
     service_endpoint.add_argument("--url", required=True)
     service_endpoint.add_argument("--apply", action="store_true")
-    service_endpoint.add_argument("--approve-digest", help="reviewed endpoint plan digest required with --apply")
     service_remove = commands.add_parser(
         "service-remove", help="root-only: remove a service and its tokens")
     service_remove.add_argument("name")
+    service_remove.add_argument("--apply", action="store_true")
     service_remove.add_argument("--expected-definition", type=json.loads,
                                 help="exact secret-free service-list record; stale definitions refuse removal")
     commands.add_parser("service-list", help="root-only: list services (no secrets)")
@@ -492,53 +518,97 @@ def build_parser() -> argparse.ArgumentParser:
     scope.add_argument("--pond")
     scope.add_argument("--site", action="store_true")
     remove.add_argument("--delete-data", action="store_true",
-                        help="also remove credentials, OAuth grants, accounts and groups (homes are never removed)")
+                        help="also remove credentials and OAuth grants; lock accounts and reserve UID/GID (homes are kept)")
     remove.add_argument("--apply", action="store_true")
-    remove.add_argument("--approve-digest")
     return parser
 
 
-def _task_policy(args: argparse.Namespace) -> None:
-    """Per-Pond task authority (root)."""
-    if os.geteuid() != 0:
-        raise PermissionError("task policy administration requires root")
-    if args.apply != bool(args.approve_digest):
-        raise ValueError("--apply requires --approve-digest from a fresh plan")
-    from .task_policy_admin import apply_task_policy, task_policy_plan
-    settings = Settings.load(protected_task_config(args.config))
-    answer = (apply_task_policy(settings,args.pond,args.approve_digest)
-              if args.apply else task_policy_plan(settings,args.pond)[0])
-    print(json.dumps(answer, indent=2))
+def _removed_service_ponds(value: str) -> str:
+    raise argparse.ArgumentTypeError("replace --ponds with --callers NAME=ROLE; declare --roles and --default-role")
+
+
+def _caller_roles(value: str) -> dict[str, str]:
+    callers = {}
+    for entry in value.split(",") if value else []:
+        name, separator, role = entry.partition("=")
+        if not separator or not name or not role or name in callers:
+            raise ValueError("--callers needs distinct NAME=ROLE entries")
+        callers[name] = role
+    return callers
+
+
+def _rendered_service_ports(config: Path) -> ServicePortReport:
+    from .site_host import Host
+    from .site_model import SiteDescription
+    from .site_render import Paths, rendered_service_ports
+    site = SiteDescription.read(config)
+    return rendered_service_ports(site, Paths(state=config.parent), Host())
+
+
+def _service_plan(args: argparse.Namespace, settings: Settings, store: OAuthAdmin,
+                  config: Path) -> dict[str, object]:
+    from .site_ports import local_tcp_port, require_protected_service_port
+    if args.action in ("service-add", "service-endpoint"):
+        require_protected_service_port(args.url, settings.protected_ports, args.name,
+                                       controller_port=settings.bind_port)
+        port = local_tcp_port(args.url)
+        if port is not None:
+            report = _rendered_service_ports(config)
+            if port not in report.ports:
+                reason = report.reason or "port not rendered"
+                raise ValueError(f"{args.name}: loopback port {port} has no confirmed rendered bind protection "
+                                 f"({reason}); review the site and apply a site render when ready")
+    if args.action in ("service-add", "service-grants"):
+        callers = _caller_roles(args.callers)
+        known = set(settings.ponds) | {"pirate/" + name for name in settings.pirate_service_callers}
+        unknown = set(callers) - known
+        if unknown:
+            raise ValueError("unknown service caller: " + ", ".join(sorted(unknown)))
+        if args.action == "service-add":
+            return store.plan_service_add(args.name, args.url, callers, args.ping_timeout,
+                                          roles=args.roles.split(","), default_role=args.default_role)
+        return store.service_grants(args.name, callers)
+    if args.action == "service-endpoint":
+        return store.service_endpoint(args.name, args.url)
+    return store.plan_service_remove(args.name, args.expected_definition)
 
 
 def _services(args: argparse.Namespace) -> None:
-    """Service credentials, URLs and caller grants (root)."""
+    """One confirmation/lock path; live service policy remains in SQLite."""
     if os.geteuid() != 0:
         raise PermissionError("service administration requires root")
-    settings = Settings.load(args.config)
+    config = args.config or CONFIG_FILE
+    if args.action == "service-ports":
+        report = _rendered_service_ports(config)
+        print(json.dumps({"protected_service_ports": report.ports, "reason": report.reason}, indent=2))
+        return
+    settings = Settings.load(config)
     store = oauth_store(settings)
-    if args.action in ("service-add", "service-grants"):
-        ponds = (args.ponds if args.action == "service-add" else args.callers).split(",")
-        callers = set(settings.ponds) | {"pirate/" + name for name in settings.pirate_service_callers}
-        unknown = [pond for pond in ponds if pond not in callers]
-        if unknown:
-            raise ValueError("unknown service caller: " + ", ".join(unknown))
-        shown: object
-        if args.action == "service-grants":
-            if args.apply != bool(args.approve_digest):
-                raise ValueError("--apply and --approve-digest must be supplied together")
-            shown = store.service_grants(args.name, ponds, args.approve_digest if args.apply else None)
-        else:
-            shown = store.service_add(args.name, args.url, ponds, args.ping_timeout)
-            print("The client secret is shown only now; it is stored as its hash.", file=sys.stderr)
-    elif args.action == "service-endpoint":
-        if args.apply != bool(args.approve_digest):
-            raise ValueError("--apply and --approve-digest must be supplied together")
-        shown = store.service_endpoint(args.name, args.url, args.approve_digest if args.apply else None)
-    elif args.action == "service-remove":
-        shown = store.service_remove(args.name, args.expected_definition)
-    else:
-        shown = store.service_list()
+    if args.action == "service-list":
+        print(json.dumps(store.service_list(), indent=2))
+        return
+    proposal = _service_plan(args, settings, store, config)
+    shown: object = proposal
+    if args.apply:
+        digest = confirm_apply(proposal, "change this service")
+        with site_lock(config.parent):
+            # Re-read the caller catalogue under the same lock as site changes;
+            # the DB owner also checks the reviewed definition in its transaction.
+            settings = Settings.load(config)
+            store = oauth_store(settings)
+            if _service_plan(args, settings, store, config) != proposal:
+                raise ValueError("service plan is stale; review a fresh plan")
+            if args.action == "service-add":
+                shown = store.service_add(args.name, args.url, _caller_roles(args.callers),
+                                          args.ping_timeout, roles=args.roles.split(","),
+                                          default_role=args.default_role, digest=digest)
+                print("The client secret is shown only now; it is stored as its hash.", file=sys.stderr)
+            elif args.action == "service-grants":
+                shown = store.service_grants(args.name, _caller_roles(args.callers), digest)
+            elif args.action == "service-endpoint":
+                shown = store.service_endpoint(args.name, args.url, digest)
+            else:
+                shown = store.service_remove(args.name, args.expected_definition, digest=digest)
     print(json.dumps(shown, indent=2))
 
 
@@ -573,33 +643,33 @@ def _oauth(args: argparse.Namespace) -> None:
             print("The client secret is shown only now.", file=sys.stderr)
         report = added
     elif args.oauth_action in ("client-remove", "client-prune"):
-        if args.apply != bool(args.approve_digest):
-            raise ValueError("--apply requires --approve-digest from a fresh plan")
-        digest = args.approve_digest if args.apply else None
-        report = (store.client_remove(args.client_id, digest) if args.oauth_action == "client-remove"
-                  else store.client_prune(args.idle_days, digest))
+        proposal = (store.client_remove(args.client_id) if args.oauth_action == "client-remove"
+                    else store.client_prune(args.idle_days))
+        if args.apply:
+            digest = confirm_apply(proposal, "remove these clients and their grants")
+            report = (store.client_remove(args.client_id, digest) if args.oauth_action == "client-remove"
+                      else store.client_prune(args.idle_days, digest))
+        else:
+            report = proposal
     else:
-        if args.apply != bool(args.approve_digest):
-            raise ValueError("--apply requires --approve-digest from a fresh plan")
         if profile is None:
             raise ValueError("revocation requires a Pond")
         client = None if args.all_clients else args.client
-        report = (store.revoke(profile, client, args.approve_digest) if args.apply
-                  else store.plan_revoke(profile, client))
+        proposal = store.plan_revoke(profile, client)
+        report = (store.revoke(profile, client,
+                      confirm_apply(proposal, "revoke these sign-ins"))
+                  if args.apply else proposal)
     print(json.dumps(report, indent=2))
 
 
 def _uninstall(args: argparse.Namespace) -> None:
     """Plan or apply configured-site removal."""
     from .uninstall import plan, apply
-    if args.apply and not args.approve_digest:
-        raise ValueError("--apply requires --approve-digest from a fresh plan")
-    if not args.apply and args.approve_digest:
-        raise ValueError("--approve-digest is only valid with --apply")
     proposal, _ = plan(
         pond=args.pond, site=args.site, delete_data=args.delete_data)
     if args.apply:
-        outcome = apply(approved_digest=args.approve_digest,
+        digest = confirm_apply(proposal, "remove this configured scope")
+        outcome = apply(approved_digest=digest,
                         pond=args.pond, site=args.site,
                         delete_data=args.delete_data)
         print(json.dumps(outcome, indent=2))
@@ -618,6 +688,16 @@ def _site_check(args: argparse.Namespace) -> None:
 
 def _ponds(args: argparse.Namespace) -> None:
     """List, show, watch and status of configured Ponds."""
+    if args.action == "list" and args.json:
+        from .site_model import SiteDescription
+        site = SiteDescription.read(args.config or CONFIG_FILE)
+        settings = site.runtime_settings()
+        print(json.dumps({"public_base_url": settings.public_base_url,
+                          "ponds": list(settings.ponds),
+                          "pirates": settings.pirate_service_callers,
+                          "pond_workers": {name: pond.identity.uid for name, pond in site.ponds.items()}},
+                         indent=2))
+        return
     settings = Settings.load(args.config)
     if args.action == "watch":
         watch(selected(settings, args.pond), args.json, args.view, args.no_color)
@@ -638,9 +718,9 @@ def main() -> None:
         raise SystemExit(pirates(sys.argv[1].removeprefix("pirate-"), sys.argv[2:]))
     parser = build_parser()
     args = parser.parse_args()
-    handlers = {"task-policy": _task_policy, "oauth": _oauth, "uninstall": _uninstall,
+    handlers = {"oauth": _oauth, "uninstall": _uninstall,
                 "site-check": _site_check,
-                **dict.fromkeys(("service-add", "service-grants", "service-endpoint",
+                **dict.fromkeys(("service-ports", "service-add", "service-grants", "service-endpoint",
                                  "service-remove", "service-list"), _services)}
     try:
         # Reject watch before reading any configuration when invoked without root.

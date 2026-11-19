@@ -6,7 +6,7 @@ import secrets
 from boring_worker_kit.deadlines import REPLY_MARGIN_SECONDS, SERVICE_OPERATION_SECONDS
 from boring_worker_kit.framing import read_frame, write_frame
 from boring_worker_kit.host_limits import FOREGROUND_REQUEST_SECONDS
-from .outcomes import FailureReport, RefusalError, is_code
+from .outcomes import FailureReport, RefusalError, refuse
 from boring_worker_kit.services import CALL_TIMEOUT_SECONDS
 from .pirates import REQUEST_TIMEOUT as PIRATE_REQUEST_SECONDS
 from .settings import EnvironmentSettings
@@ -24,16 +24,18 @@ def _response_result(response: dict[str, object]) -> dict[str, object]:
         result = response["result"]
         if isinstance(result, dict):
             return result
-    elif response.get("ok") is False and keys == {"ok", "refusal"}:
-        refusal = response["refusal"]
-        if (isinstance(refusal, dict) and is_code(refusal.get("code"))
-                and isinstance(refusal.get("message"), str)):
-            raise RefusalError(refusal)
-    elif response.get("ok") is False and keys == {"ok", "failure"}:
-        failure = response["failure"]
-        if isinstance(failure, str):
-            raise FailureReport(failure)
-    raise FailureReport("invalid worker response; the operation may have run")
+    elif response.get("ok") is False and keys in ({"ok", "refusal"}, {"ok", "failure"}):
+        key = "refusal" if "refusal" in response else "failure"
+        data = response[key]
+        if isinstance(data, dict):
+            try:
+                report = RefusalError(data) if key == "refusal" else FailureReport.from_data(data)
+            except (TypeError, ValueError):
+                pass
+            else:
+                raise report
+    raise FailureReport("bad_reply", "invalid worker response; the operation may have run",
+                        component="worker", effects="unknown")
 
 
 class WorkerClient:
@@ -47,7 +49,8 @@ class WorkerClient:
                 self._request(environment, operation, budget_seconds=budget, **arguments),
                 budget + REPLY_MARGIN_SECONDS)
         except asyncio.TimeoutError as error:
-            raise FailureReport("worker request deadline exceeded; the operation may have run") from error
+            raise FailureReport("timeout", "worker request deadline exceeded; the operation may have run",
+                                component="worker", effects="unknown") from error
 
     async def _request(self, environment: str, operation: str, **arguments) -> dict[str, object]:
         try:
@@ -57,15 +60,20 @@ class WorkerClient:
         try:
             reader, writer = await asyncio.open_unix_connection(settings.socket_path)
         except (FileNotFoundError, ConnectionRefusedError, PermissionError) as error:
-            raise FailureReport(f"the {environment} worker is not reachable "
-                                f"({type(error).__name__}); nothing was sent") from error
+            raise refuse("unavailable", f"the {environment} worker is not reachable "
+                         f"({type(error).__name__}); nothing was sent", component="worker", effects="none") from error
         try:
             await write_frame(writer, {"request_id": secrets.token_urlsafe(18),
                                        "operation": operation, **arguments})
-            response = await read_frame(reader)
+            try:
+                response = await read_frame(reader)
+            except (ValueError, RecursionError) as error:
+                raise FailureReport("bad_reply", "invalid worker response frame; the operation may have run",
+                                    component="worker", effects="unknown") from error
         except (ConnectionError, asyncio.IncompleteReadError) as error:
-            raise FailureReport(f"the {environment} worker closed the connection before answering "
-                                f"({type(error).__name__}); the operation may have run") from error
+            raise FailureReport("worker_interrupted", f"the {environment} worker closed the connection before answering "
+                                f"({type(error).__name__}); the operation may have run",
+                                component="worker", effects="unknown") from error
         finally:
             writer.close()
             try:
@@ -157,4 +165,5 @@ class WorkerClient:
                 wait_seconds + REPLY_MARGIN_SECONDS,
             )
         except asyncio.TimeoutError as error:
-            raise FailureReport("job_wait worker deadline exceeded; nothing was changed") from error
+            raise refuse("timeout", "job_wait worker deadline exceeded; nothing was changed",
+                         component="worker", operation="job_wait", effects="none") from error

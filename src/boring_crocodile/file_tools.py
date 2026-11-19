@@ -1,11 +1,13 @@
 """Controller file-tool registration; effects and root policy belong to the worker."""
 from __future__ import annotations
-from typing import Annotated, Callable
+import json
+from typing import Annotated, Callable, cast
 from mcp.server.mcpserver import MCPServer
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 from boring_worker_kit.batch_contracts import Encoding, Newline, SearchLimit
 from .worker_client import WorkerClient
+from .image_limits import DEFAULT_PX, MIN_PX, MAX_PX
 
 class FileEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -26,6 +28,28 @@ def register_file_tools(mcp: MCPServer, workers: WorkerClient,
         """Read bounded UTF-8/UTF-16 text with LF display, disk format and whole-file byte hash."""
         return await workers.file_call(selected_environment(), "file_read", root=root, path=path,
                                        start_line=start_line, line_count=line_count)
+
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False,
+                                           idempotent_hint=True, open_world_hint=False))
+    async def file_read_image(root: str, path: str,
+                              max_px: Annotated[int, Field(strict=True, ge=MIN_PX, le=MAX_PX)] = DEFAULT_PX,
+                              crop: Annotated[list[Annotated[int, Field(strict=True)]],
+                                              Field(min_length=4, max_length=4)] | None = None) -> CallToolResult:
+        """View JPEG, PNG or WebP under file-root policy. Crop [x,y,w,h] uses oriented pixels.
+
+        Returns the first frame, scaled without upscaling, as image plus metadata text.
+        Tagged colours become sRGB; unusable ICC profiles render unconverted and are marked in metadata.
+        Source: 25 MiB; JPEG 50 MP, opaque RGB PNG 40 MP, other PNG 16 MP, WebP 12 MP.
+        Actual format/mode decides, not the extension. Progressive JPEG can have a lower
+        sampling/mode and crop/detail cap, named in its refusal. Answer: 1 MiB. Not a batch step.
+        """
+        result = await workers.file_call(selected_environment(), "file_read_image",
+                                         root=root, path=path, max_px=max_px, crop=crop)
+        return CallToolResult(content=[
+            ImageContent(type="image", data=cast(str, result["data"]),
+                         mime_type=cast(str, result["mime_type"])),
+            TextContent(type="text", text=json.dumps(result["metadata"], ensure_ascii=False,
+                                                     allow_nan=False, separators=(",", ":")))])
 
     @mcp.tool()
     async def file_write(root: str, path: str, content: str,

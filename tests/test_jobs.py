@@ -9,7 +9,7 @@ from boring_worker_kit.execution import EnvironmentExecutor
 from boring_worker_kit.host_limits import HostLimits
 from boring_crocodile.jobs import ManagedJobs
 from boring_crocodile.settings import EnvironmentSettings
-from boring_crocodile.outcomes import Refusal
+from boring_crocodile.outcomes import Refused
 from boring_worker_kit.task_client import ContainmentError
 
 
@@ -78,7 +78,8 @@ class ManagedJobsTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*self.jobs.running.values())
         output = self.jobs.output(job["job_id"])
         self.assertEqual(output["state"], "failed")
-        self.assertIn("cleanup not confirmed", output["result"]["error"])
+        self.assertEqual(output["result"]["failure"]["message"],
+                         "ContainmentError: The Worker failed; see its log for details.")
 
     async def test_start_status_output_and_recovery(self):
         first = self.jobs.start("printf done", None, 5)
@@ -116,10 +117,10 @@ class ManagedJobsTest(unittest.IsolatedAsyncioTestCase):
                     first["job_id"][:-1], None, 7):
             for method in (self.jobs.status, self.jobs.output, self.jobs.stop):
                 with self.assertRaisesRegex(
-                        Refusal, "^invalid_request: job_id must be the 32-character id"):
+                        Refused, "^invalid_request: job_id must be the 32-character id"):
                     method(bad)
         for method in (self.jobs.status, self.jobs.output, self.jobs.stop):
-            with self.assertRaisesRegex(Refusal, "^not_found: unknown job"):
+            with self.assertRaisesRegex(Refused, "^not_found: unknown job"):
                 method("0" * 32)
         self.assertFalse(self.jobs.running[first["job_id"]].cancelled())
 
@@ -128,7 +129,7 @@ class ManagedJobsTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(jobs_module, "MAX_UNFINISHED", 2):
             self.jobs.start("one", None, 5)
             self.jobs.start("two", None, 5)
-            with self.assertRaisesRegex(Refusal, "^limit: too many unfinished jobs"):
+            with self.assertRaisesRegex(Refused, "^limit: too many unfinished jobs"):
                 self.jobs.start("three", None, 5)
         self.assertEqual(len(self.jobs.list()["jobs"]), 2)
 
@@ -147,7 +148,7 @@ class ManagedJobsTest(unittest.IsolatedAsyncioTestCase):
                    ("b" * 32, "run-key", "job-v1:b", "running", 3.0, 3.0, None))
         db.commit()
         db.close()
-        with self.assertRaisesRegex(ValueError, "unsupported schema"):
+        with self.assertRaisesRegex(ValueError, "unsupported receipt schema"):
             ManagedJobs(self.settings, self.executor)
         # Nothing was rewritten: the row is still there, still running.
         db = sqlite3.connect(path)
@@ -198,7 +199,7 @@ class ManagedJobsTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*self.jobs.running.values(), return_exceptions=True)
 
     async def test_rejects_out_of_root_and_requires_containment(self):
-        with self.assertRaisesRegex(Refusal, "^invalid_request: .*outside allowed roots"):
+        with self.assertRaisesRegex(Refused, "^invalid_request: .*outside allowed roots"):
             self.jobs.start("true", "/tmp", 1)
         from dataclasses import replace
         with self.assertRaisesRegex(ValueError, "require systemd"):
@@ -287,8 +288,8 @@ class JobProtocolTest(unittest.IsolatedAsyncioTestCase):
         listed = (await self.client.list_jobs("pond"))["jobs"]
         self.assertEqual(len(listed), 1)
         job_id = listed[0]["job_id"]
-        status = await self.client.job_action("pond", "job_status", job_id)
-        self.assertEqual(status["state"], "running")
+        status = await self.client.job_wait("pond", [job_id], 0)
+        self.assertEqual(status["jobs"][0]["state"], "running")
         self.fake.release.set()
         await asyncio.gather(*self.worker.jobs.running.values())
         result = await self.client.job_action("pond", "job_output", job_id)
@@ -297,9 +298,8 @@ class JobProtocolTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_job_id_validation_through_worker(self):
         from boring_crocodile.outcomes import RefusalError
-        with self.assertRaises(RefusalError) as malformed:
-            await self.client.job_action("pond", "job_status", "not-a-job-id")
-        self.assertEqual(malformed.exception.code, "invalid_request")
+        malformed = await self.client.job_wait("pond", ["not-a-job-id"], 0)
+        self.assertEqual(malformed["jobs"][0]["refusal"]["code"], "invalid_request")
         with self.assertRaises(RefusalError) as unknown:
             await self.client.job_action("pond", "job_output", "f" * 32)
         self.assertEqual(unknown.exception.code, "not_found")
@@ -326,7 +326,7 @@ class JobProtocolTest(unittest.IsolatedAsyncioTestCase):
         stopping = await self.client.job_action("pond", "job_stop", started["job_id"])
         self.assertIn(stopping["state"], ("stopping", "cancelled"))
         await asyncio.gather(*list(self.worker.jobs.running.values()), return_exceptions=True)
-        self.assertEqual((await self.client.job_action("pond", "job_status", started["job_id"]))["state"],
+        self.assertEqual((await self.client.job_wait("pond", [started["job_id"]], 0))["jobs"][0]["state"],
                          "cancelled")
 
 
@@ -377,9 +377,9 @@ class JobOperationsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.jobs.store.count(("queued", "running", "stopping")), 2)
 
     async def test_exactly_one_of_command_or_operations_is_required(self):
-        with self.assertRaisesRegex(Refusal, "^invalid_request: exactly one"):
+        with self.assertRaisesRegex(Refused, "^invalid_request: exactly one"):
             self.jobs.start(None, None, None)
-        with self.assertRaisesRegex(Refusal, "^invalid_request: exactly one"):
+        with self.assertRaisesRegex(Refused, "^invalid_request: exactly one"):
             self.jobs.start("printf both", None, None, operations=self._op())
 
     async def test_operations_job_stop_cancels_mid_run(self):
@@ -401,9 +401,9 @@ class JobOperationsTest(unittest.IsolatedAsyncioTestCase):
         # the host's lifetime cap (HostLimits(2, 290) here).
         for timeout in (0, 86401):
             with self.subTest(timeout=timeout):
-                with self.assertRaisesRegex(Refusal, "^invalid_request: "):
+                with self.assertRaisesRegex(Refused, "^invalid_request: "):
                     self.jobs.start("printf no", None, timeout)
-                with self.assertRaisesRegex(Refusal, "^invalid_request: "):
+                with self.assertRaisesRegex(Refused, "^invalid_request: "):
                     self.jobs.start(None, None, timeout, operations=self._op())
         accepted = self.jobs.start(None, None, 86400, operations=self._op())
         self.assertEqual(accepted["state"], "queued")
@@ -443,7 +443,7 @@ class JobWaitTest(unittest.IsolatedAsyncioTestCase):
         result = await self.jobs.wait([job_id, "f" * 32, "nope"], 5)
         self.assertTrue(result["settled"])
         self.assertEqual(result["jobs"][0]["state"], "completed")
-        self.assertEqual(result["jobs"][1], {"job_id": "f" * 32, "refusal": {
+        self.assertEqual(result["jobs"][1], {"job_id": "f" * 32, "refusal": {"status": "refused",
             "code": "not_found", "message": "unknown job"}})
         self.assertEqual(result["jobs"][2]["refusal"]["code"], "invalid_request")
 
@@ -452,5 +452,5 @@ class JobWaitTest(unittest.IsolatedAsyncioTestCase):
                                       (["f" * 32], -1), (["f" * 32], float("nan")),
                                       (["f" * 32], True)):
             with self.subTest(job_ids=str(job_ids)[:20], wait_seconds=wait_seconds):
-                with self.assertRaisesRegex(Refusal, "^invalid_request"):
+                with self.assertRaisesRegex(Refused, "^invalid_request"):
                     await self.jobs.wait(job_ids, wait_seconds)

@@ -3,7 +3,8 @@ PartOf=boring-crocodile-mcp.target
 Description=Boring Crocodile MCP control plane
 After=network-online.target boring-crocodile-worker-pond.service boring-crocodile-worker-second.service
 Wants=network-online.target
-Requires=boring-crocodile-worker-pond.service boring-crocodile-worker-second.service
+Requires=boring-crocodile-worker-pond.service boring-crocodile-worker-second.service boring-crocodile-mcp.socket
+After=boring-crocodile-mcp.socket
 
 [Service]
 Type=simple
@@ -18,7 +19,7 @@ SupplementaryGroups=boring-crocodile boring-crocodile-second
 Environment=BORING_CROCODILE_CONFIG=/etc/boring-crocodile/config.toml
 LoadCredential=approval-secret:/etc/boring-crocodile/credentials/approval-secret
 LoadCredential=second-approval-secret:/etc/boring-crocodile/credentials/second-approval-secret
-ExecStart=/opt/boring-crocodile/current/bin/boring-crocodile-mcp
+ExecStart=/opt/boring-crocodile/current/bin/boring-crocodile-mcp --ponds pond second
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=yes

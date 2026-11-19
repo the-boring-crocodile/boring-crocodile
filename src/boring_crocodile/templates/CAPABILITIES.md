@@ -4,9 +4,8 @@ This is shared MCP guidance. The connected Pond's permissions and actual service
 state determine what is available. Read its maintained welcome, agreement and
 project context through `pond_bootstrap`; these remain owned by the inhabitant.
 The separate `capabilities` summary reports this Pond's configured access and
-loaded command limits. `pond_profile` identifies the bound Pond where enabled;
-`pond_ping` confirms connectivity, not full health. The connection decides the
-Pond: no tool takes an `environment` argument.
+loaded command limits. The connection decides the Pond: no tool takes an
+`environment` argument.
 
 ## Working well
 
@@ -33,7 +32,8 @@ Pond: no tool takes an `environment` argument.
   `job_wait` step's own bound is clamped further by whatever of the batch's
   shared deadline remains when it runs.
 - `exec` runs a bounded foreground command when command execution is enabled.
-  `pond_limits` reports the command task slots and host-derived time limits.
+  Bootstrap's `capabilities.command_limits` reports the command task slots and
+  host-derived time limits.
   The hosted client's deadline may be shorter. A result carries `cwd`,
   `exit_code`, `stdout`/`stderr` with `stdout_truncated`/`stderr_truncated`,
   `timed_out`, `duration_seconds` and `effective_timeout_seconds`. A returned
@@ -44,20 +44,21 @@ Pond: no tool takes an `environment` argument.
   exactly one of a `command`, an `operations` step list (the `batch` steps
   without `service_call`), or a `pirate` job (below).
   `timeout_seconds` defaults to 120 s for a command and 600 s for operations
-  and is at most 86400 s (one day); `pond_limits` reports a lower host cap for
+  and is at most 86400 s (one day); bootstrap command limits report a lower host cap for
   command jobs. There is no unlimited job.
-  `job_list` finds jobs; `job_status`, `job_output` and `job_stop` take the
+  `job_list` finds jobs; `job_output` and `job_stop` take the
   `job_id`. `job_output` returns the job's `result` (for a command: exit code
-  and the bounded stdout/stderr output streams). `job_stop` stops the job; it
-  ends `cancelled`.
+  and the bounded stdout/stderr output streams). `job_stop` stops a command or
+  operations job and ends it `cancelled`; a Pirate stop always ends
+  `failed/cleanup_unconfirmed`.
   `job_wait(job_ids, wait_seconds)` waits until every listed job is in a
   terminal state, or `wait_seconds` (0..60, default 45; 0 means look once) runs
   out, and reports each job's state, not its `result`. `wait_expired: true` is
   not an error: call again rather than start the work again. An unknown id is
   reported with its `refusal` and counts as settled.
   For a command job, `completed` means it stopped running: exit 0, non-zero
-  exit and timeout termination all end in `completed`. After `job_wait` or
-  `job_status`, inspect `job_output.result.exit_code` and `result.timed_out`
+  exit and timeout termination all end in `completed`. After `job_wait`,
+  inspect `job_output.result.exit_code` and `result.timed_out`
   to determine its outcome. While a job is running, `job_output` returns
   `state: running, partial: true` and may include output so far; that snapshot
   is not the final result.
@@ -77,6 +78,25 @@ Pond: no tool takes an `environment` argument.
   Byte reads return ranged base64 plus the whole-file hash; byte writes replace
   or overwrite a range without gaps. Each chunk is at most 64 KiB, still within
   the configured whole-file and output limits. Both byte tools work in batch.
+- `file_read_image(root, path, max_px=1568, crop=null)` shows JPEG, PNG or WebP
+  under the same file-root policy. Source cap: 25 MiB; JPEG 50 MP, opaque RGB
+  PNG 40 MP, other PNG 16 MP, WebP 12 MP. The actual format/mode decides, not
+  the extension. Progressive JPEG can have a lower cap for its sampling/mode
+  and crop/detail; a refusal names it. Lower max_px or pre-scale the source
+  before retrying such a refusal. The worker applies
+  EXIF orientation, crops `[x,y,w,h]` in oriented pixels, then scales the longest
+  side to max_px (64–2048), never upscaling. Crops must fit fully inside the image.
+  Animated PNG/WebP returns frame zero and reports `frames`. Metadata is removed.
+  The answer is an image block plus compact metadata text: format, width, height,
+  alpha_flattened, colour, frames, source (bytes, sha256, format, oriented width/height),
+  and crop. Alpha uses PNG, otherwise JPEG; an oversized PNG is flattened onto
+  white and marked alpha_flattened. Answer cap: 1 MiB. Unsupported/corrupt/oversized
+  sources are refused as unsupported/unreadable/limit. Source ICC colours are
+  converted to sRGB with perceptual intent after scaling and before the profile
+  is removed. `colour` is converted, untagged (no profile), or profile_unusable
+  (broken/incompatible profile; shown without colour conversion). Alpha is kept.
+  One image operation runs
+  per worker; an occupied slot can return busy. There is no image batch step.
 - Pirates are agents running under their own Unix accounts. Each serves one or
   more flavours and registers them with this Pond itself. `pirate_list` shows
   every registered `pirate`/`flavour` with
@@ -85,15 +105,18 @@ Pond: no tool takes an `environment` argument.
   description. Give it work as a job:
   `job_start(pirate={"pirate", "flavour", "assignment", "timeout_seconds"})`,
   optionally with `"overrides"` (`system`, `tools`, `services`, `max_turns`,
-  `settings`) for a flavour whose description shows `allow_overrides`: they
-  only narrow it, within its `caps`; any other flavour refuses them. The Pirate
+  `settings`) for a flavour whose description shows `allow_overrides`:
+  `system` replaces its system text; `max_turns` may increase up to the Pirate's
+  cap; `tools` and `services` only narrow its grants; `settings` are validated
+  by the provider and bounded by the output-token cap. Other flavours refuse
+  overrides. The Pirate
   enforces the timeout, 0.1 to 86400 s like every job (null: its
   default, waited for at most 86400 s). The job holds one
   connection to the Pirate until it answers: its answer is the job's `result`;
   its refusal (for example `busy`, one job per flavour at a time) ends the job
   `refused`; a Pirate that drops the connection fails the job. `job_stop`
-  closes the connection to request cancellation. With no cleanup acknowledgement,
-  the local job ends `failed` with remote cleanup unconfirmed; inspect the Pirate
+  closes the connection to request cancellation. This protocol has no cleanup
+  acknowledgement: the local job always ends `failed/cleanup_unconfirmed`; inspect the Pirate
   before retrying. Pirate jobs need managed jobs (command execution with its task
   runner).
 
@@ -105,46 +128,65 @@ independently checked.
 
 ## Refusals and failures
 
-A refusal is a normal answer you can act on, not a breakdown. It arrives as
-an error result with compact JSON text and a matching structured object:
-`{"code": ..., "message": ..., ...details}`. Some clients prepend
-`Error executing tool <name>: ` to the text; use the structured object when
-available and the text otherwise. Our codes:
+Both are flat JSON outcomes with `status`, `code`, `message` and extra detail
+fields. The code names the cause; status says whether it ran:
 
-- `invalid_request`: the request itself is malformed or not acceptable; change
-  it. Rejected arguments may be named in `fields` (names only, never values).
-- `not_found`: the named file, directory, job, Pirate or service is not here.
-- `forbidden`: this Pond's policy or connection does not allow it, or a
-  service rejected the call token.
-- `stale`: the file changed since you read it; `current_sha256` is its hash
-  now (`null` when it is absent). Re-read before editing again.
-- `busy`: a shared resource is held right now; try again shortly.
-- `limit`: a size, count or capacity limit was reached, or no time was left
-  for the work (nothing was sent).
-- `not_admitted`: the work was not started; retrying is safe.
-- `unavailable`: the Pirate or service is not listening or missed its last ping.
+- `{"status":"refused","code":"busy","message":"all slots are in use"}`:
+  nothing started or changed. Retry after the cause is gone.
+- `{"status":"failed","code":"timeout","message":"worker did not answer","component":"worker","effects":"unknown"}`:
+  work started and did not complete; it may have had effects. Check before retrying.
 
-Arguments that do not match a tool's schema -- unknown, missing or of the
-wrong type -- are rejected before anything runs, with a plain-text validation
-message naming the argument (for example `idempotency_key: Extra inputs are
-not permitted`). For an argument you expected to work, your tool list is
-probably stale; refresh it.
+Tool errors carry compact JSON text and identical structuredContent. Batch and
+job records embed the same object under `refusal` or `failure`. Batch step
+statuses and job states remain lifecycle data.
+A nonzero command exit is result data, not a transport failure.
 
-A Pirate's or service's own refusal is passed through with its own code
-unchanged (for example `busy`). A failure -- a bug, crash or
-broken dependency, not an answer about your request -- arrives as JSON
-`{"failure": "..."}` saying what failed and whether the call may have run. A
-foreground `exec` (or batch `exec` step) that passed its request deadline
-after it started is such a failure (`ForegroundInterrupted: ... command may
-have started`): inspect before retrying. A refusal always means the work did
-not run.
-Only a bare `Error executing tool <name>` with no text is a crash inside the MCP
-server itself. Inside a `batch`, a refused step has `status: "refused"` and a
-`refusal` object of the same shape; `on_error=stop` stops on it as on a failed
-step, with `stop_reason: "step_refused"`. In `job_wait`, an id that is refused
-(for example an unknown job) is reported with its `refusal` and counts as
-settled; the other jobs are still reported. A Pirate job its Pirate refused
-ends `refused` with that `refusal` in its `result`.
+The code names the cause independently of status; components document their additional codes.
+
+- `invalid_request`: change the request; rejected `fields` name keys only, never values.
+- `not_found`: the named thing is absent in this scope; check the name or list first.
+- `forbidden`: policy denies the call, including a service rejecting its call token; check the grant.
+  A non-regular file adds `kind`: directory (use file_list), symlink (links are
+  not followed), or other (sockets/devices/FIFOs or disallowed multiple hard links).
+  The message gives the specific cause and next step.
+- `stale`: re-read before editing; `current_sha256` is the current hash, or null when the file is absent.
+- `busy`: a shared resource is occupied; retry after it is released.
+- `locked`: a lock prevents access; release it or wait for its owner.
+- `limit`: reduce size/count or wait for capacity; the stated bound was reached.
+- `not_admitted`: nothing was dispatched before the deadline; retry after admission is possible.
+- `unavailable`: the component is not listening or missed its ping; check its availability.
+- `timeout`: the deadline passed; use status/effects to decide whether to inspect before retrying.
+- `unsupported`: choose a supported capability or format.
+- `unreadable`: check the source file or encoding before retrying.
+- `conflict`: reconcile the conflicting state before submitting again.
+- `bad_reply`: the downstream reply violated its contract; inspect that component.
+- `cleanup_unconfirmed`: inspect remaining work before retrying; cleanup has not been established.
+- `upstream_error`: inspect the downstream error details.
+
+Some clients prefix JSON text with `Error executing tool <name>: `; prefer
+structuredContent when present. Worker failures include worker_failed,
+worker_interrupted and foreground_interrupted. Service protocol and unstructured
+tool errors use upstream_error, with service_code for protocol errors;
+save write errors use write_failed.
+
+A service outcome needs `status: refused|failed`, a valid lowercase cause code
+and a string message. Its status, code and details pass through unchanged.
+Unexpected controller exceptions and SDK argument-validation errors retain
+the SDK's reporting; they are not guessed into an outcome by parsing text.
+
+A refused result means the work did not run. A failed result or lost reply
+can have effects; inspect files, job receipts or the relevant service.
+Worker unreachable before sending is refused/unavailable; a job_wait response
+deadline is refused/timeout because that wait changes nothing.
+Within a batch, a refused step has status refused and a refusal object;
+on_error stop stops on it with step_refused. Unknown IDs in job_wait carry
+their refusal and count as settled. Pirate refusals end jobs refused.
+Stopping a Pirate always ends failed with cleanup_unconfirmed; inspect the
+Pirate before retrying.
+
+Arguments outside a tool's schema are rejected before anything runs, with
+validation text naming the argument. Refresh a stale tool list before retrying.
+A bare SDK error without our outcome is a crash, not proof that nothing ran.
 
 ## Where were we?
 
@@ -178,11 +220,11 @@ example). `service_list` shows those registered with this Pond, with
 `available`, `misses` and `last_miss` from the last ping. `service_describe`
 lists a service's tools with their input schemas. `service_call(service, tool,
 arguments)` calls one tool; the service validates the arguments. A service's
-refusal arrives with its own code (`tool_error` when it gave none,
-`service_error` with `service_code` for a protocol error); a service that
-rejects the call token (HTTP 401/403) is `forbidden`. A service gets at most
+valid outcome keeps its status and code. An invalid or unstructured tool error
+is `failed/upstream_error`; a protocol error uses the same cause and keeps
+`service_code`. A service that rejects the call token (HTTP 401/403) is `forbidden`. A service gets at most
 30 s to answer, less when the request has less time left (inside a batch: what
-remains of it, minus 5 s). With no time left the call is refused `limit` and
+remains of it, minus 5 s). With no time left the call is refused `not_admitted` and
 nothing is sent. A timeout or dropped connection is a failure that may have
 run: check before repeating a write. A service that is not registered here is
 `not_found`; one that missed its last ping is `unavailable` until it answers

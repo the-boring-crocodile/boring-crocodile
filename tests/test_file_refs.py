@@ -113,7 +113,7 @@ class FileReferenceTest(unittest.IsolatedAsyncioTestCase):
                                                  self.worker.files)
         self.assertEqual(resolved, {"x": [{"y": "0123456789"}, 3, "z"], "w": "abcdefghij"})
         self.assertEqual([u["path"] for u in used], ["a.txt", "b.txt"])
-        with patch.object(file_refs, "MAX_REFERENCE_BYTES", 15), self.assertRaises(file_refs.Refusal) as caught:
+        with patch.object(file_refs, "MAX_REFERENCE_BYTES", 15), self.assertRaises(file_refs.Refused) as caught:
             await file_refs.resolve({"x": ref("a.txt"), "w": ref("b.txt")}, self.worker.files)
         self.assertEqual(caught.exception.code, "limit")  # 10 + 10 > 15
 
@@ -368,8 +368,8 @@ class FileReferenceTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(services, "CALL_TIMEOUT_SECONDS", 0.2):
             result = await self.client.batch("test", batch, {"slow": "good"})
         self.assertEqual([e["status"] for e in result["results"]], ["unknown", "succeeded"])
-        self.assertIn("may have run", result["results"][0]["error"])
-        self.assertNotIn("batch deadline", result["results"][0]["error"])
+        self.assertIn("may have run", result["results"][0]["failure"]["message"])
+        self.assertNotIn("batch deadline", result["results"][0]["failure"]["message"])
         self.assertIsNone(result["stop_reason"])
         batch["on_error"] = "stop"
         (self.work / "after.txt").unlink()

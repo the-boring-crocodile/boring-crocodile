@@ -90,7 +90,6 @@ def run(base_url, approval_file, pond, emit=print):
         ("initialize", "initialize", {"protocolVersion": "2025-03-26",
             "capabilities": {}, "clientInfo": {"name": "synthetic-guest-probe", "version": "1"}}),
         ("tools_list", "tools/list", {}),
-        ("pond_profile", "tools/call", {"name": "pond_profile", "arguments": {}}),
     ], 1):
         result, _ = request(stage, "POST", f"/mcp/{pond}", (200,), {
             "jsonrpc": "2.0", "id": number, "method": method, "params": params}, token=token)

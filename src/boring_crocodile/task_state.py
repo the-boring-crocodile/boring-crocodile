@@ -6,13 +6,14 @@ choose identifiers, so there is nothing to collide, deduplicate or match.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 
-TERMINAL_STATES = frozenset({"completed", "refused", "failed", "timed_out", "cancelled", "interrupted"})
+TERMINAL_STATES = frozenset({"completed", "refused", "failed", "cancelled", "interrupted"})
 UNFINISHED_STATES = ("queued", "running", "stopping")
 SCHEMA_VERSION = 1
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,62}\Z")
@@ -21,6 +22,18 @@ _COLUMNS = "id,state,created,updated,result,metadata"
 
 def _dump(value: object) -> str:
     return json.dumps(value, separators=(",", ":"), allow_nan=False)
+
+
+def _validate_schema(db, path: Path, table: str) -> None:
+    if not _NAME.fullmatch(table):
+        raise ValueError("invalid receipt table")
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    columns = [row[1] for row in db.execute(f"PRAGMA table_info({table})")]
+    if version != SCHEMA_VERSION or columns != _COLUMNS.split(","):
+        raise ValueError(f"unsupported receipt schema version {version} or table {table!r} in {path}; "
+                         "database left unchanged; archive/remove this receipt store before restarting")
+
+
 
 
 class ReceiptStore:
@@ -33,25 +46,29 @@ class ReceiptStore:
         if not _NAME.fullmatch(table):
             raise ValueError("invalid receipt table")
         self.table = table
-        self.db = sqlite3.connect(path, isolation_level=None)
         try:
-            version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, SCHEMA_VERSION):
-                raise ValueError(f"unsupported receipt schema version {version}; database left unchanged")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(fd)
+            created = True
+        except FileExistsError:
+            created = False
+        self.db = sqlite3.connect(path.absolute().as_uri() + "?mode=rw", uri=True, isolation_level=None)
+        try:
             self.db.execute("PRAGMA busy_timeout=3000")
-            columns = [row[1] for row in self.db.execute(f"PRAGMA table_info({table})")]
-            if columns and columns != _COLUMNS.split(","):
-                raise ValueError(f"receipt table {table!r} in {path} has an unsupported schema "
-                                 f"(columns: {', '.join(columns)}); database left unchanged")
-            self.db.execute(self._schema(table))
-            self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            if created:
+                self.db.execute("BEGIN IMMEDIATE")
+                self.db.execute(self._schema(table))
+                self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                self.db.execute("COMMIT")
+            else:
+                _validate_schema(self.db, path, table)
         except BaseException:
             self.db.close()
             raise
 
     @staticmethod
     def _schema(table: str) -> str:
-        return f"""CREATE TABLE IF NOT EXISTS {table} (
+        return f"""CREATE TABLE {table} (
             id TEXT PRIMARY KEY, state TEXT NOT NULL,
             created REAL NOT NULL, updated REAL NOT NULL,
             result TEXT, metadata TEXT NOT NULL DEFAULT '{{}}')"""

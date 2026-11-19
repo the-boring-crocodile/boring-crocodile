@@ -20,7 +20,8 @@ from boring_service_kit.issuer.clients import add_client, list_clients, prune_cl
 from .oauth_records import (
     GRANTS as _GRANTS, VERSION as _VERSION, Transaction, add_service, approval_digest,
     decode as _decode, delete, open_readonly as _open_ro, remove_service, rows, selected,
-    services, service_grants, service_endpoint, validate as _validate,
+    services, caller_services, revoke_caller, service_grants, service_endpoint, service_add_plan,
+    service_remove_plan, validate as _validate,
 )
 
 
@@ -166,17 +167,24 @@ class OAuthAdmin:
         return {"applied": digest is not None, "idle_days": idle_days, "clients": stale,
                 "plan_digest": planned}
 
-    def service_add(self, name: str, url: str, ponds: list[str],
-                    ping_timeout: float | None = None) -> dict[str, object]:
+    def plan_service_add(self, name: str, url: str, callers: dict[str, str],
+                         ping_timeout: float | None = None, *, roles: list[str], default_role: str) -> dict[str, object]:
+        _safe_source(self.path, self.controller_uid)
+        with closing(_open_ro(self.path)) as db:
+            _validate(db)
+            return service_add_plan(db, name, url, callers, ping_timeout, roles=roles, default_role=default_role)
+
+    def service_add(self, name: str, url: str, callers: dict[str, str],
+                    ping_timeout: float | None = None, *, roles: list[str], default_role: str,
+                    digest: str | None = None) -> dict[str, object]:
         """The answer carries the client secret; it is shown once and stored hashed."""
         _safe_source(self.path, self.controller_uid)
         with Transaction(self.path) as db:
             _validate(db)
-            if ping_timeout is None:
-                return add_service(db, name, url, ponds)
-            return add_service(db, name, url, ponds, ping_timeout)
+            return add_service(db, name, url, callers, ping_timeout, roles=roles,
+                               default_role=default_role, digest=digest)
 
-    def service_grants(self, name: str, callers: list[str], digest: str | None = None) -> dict[str, object]:
+    def service_grants(self, name: str, callers: dict[str, str], digest: str | None = None) -> dict[str, object]:
         _safe_source(self.path, self.controller_uid)
         if digest is None:
             with closing(_open_ro(self.path)) as db:
@@ -196,13 +204,38 @@ class OAuthAdmin:
             _validate(db)
             return service_endpoint(db, name, url, digest)
 
-    def service_remove(self, name: str, expected: dict[str, object] | None = None) -> dict[str, object]:
+    def plan_service_remove(self, name: str, expected: dict[str, object] | None = None) -> dict[str, object]:
+        _safe_source(self.path, self.controller_uid)
+        with closing(_open_ro(self.path)) as db:
+            _validate(db)
+            return service_remove_plan(db, name, expected)
+
+    def service_remove(self, name: str, expected: dict[str, object] | None = None, *,
+                       digest: str | None = None) -> dict[str, object]:
         _safe_source(self.path, self.controller_uid)
         with Transaction(self.path) as db:
             _validate(db)
-            if not remove_service(db, name, expected):
+            if not remove_service(db, name, expected, digest=digest):
                 raise ValueError(f"no service named {name!r}")
         return {"status": "removed", "name": name}
+
+    def caller_services(self, caller: str) -> list[dict[str, object]]:
+        """Secret-free grants for an admission/retirement plan."""
+        _safe_source(self.path, self.controller_uid)
+        with closing(_open_ro(self.path)) as db:
+            _validate(db)
+            return caller_services(db, caller)
+
+    def retire_caller(self, caller: str, expected: list[dict[str, object]]) -> None:
+        """Revoke exactly the reviewed grants and that caller's issued service tokens."""
+        _safe_source(self.path, self.controller_uid)
+        with Transaction(self.path) as db:
+            _validate(db)
+            if caller_services(db, caller) != expected:
+                raise ValueError("caller grants changed since the reviewed plan")
+            chosen = selected(rows(db), None, caller=caller)
+            revoke_caller(db, caller)
+            delete(db, chosen)
 
     def service_list(self) -> list[dict[str, object]]:
         with closing(_open_ro(self.path)) as db:
@@ -225,7 +258,7 @@ class OAuthAdmin:
             os.close(fd)
             fd = -1
             with closing(_open_ro(self.path)) as source:
-                _validate(source)
+                _validate(source, upgrade_source=True)
                 with closing(sqlite3.connect(destination)) as target:
                     source.backup(target)
                     if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":

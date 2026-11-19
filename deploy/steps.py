@@ -6,19 +6,20 @@ run HOME/current/bin/...; the configuration is /etc/boring-crocodile/config.toml
 An update restarts the site's services that run; a stopped site stays stopped
 (the engine's switch decides by `systemctl is-active`, units() only lists).
 """
-import fcntl
 import json
 import os
 import sqlite3
-import stat
-from contextlib import closing, contextmanager
+import sys
+from contextlib import closing, contextmanager, ExitStack
 import time
 import tomllib
 from pathlib import Path
 
 import boring_deploy
+from site_layout import SITE_LOCK, site_lock
 
 _before = {}
+_before_unknown = None
 
 
 def _config(ctx):
@@ -44,34 +45,26 @@ def _configured(ctx):
     return _config(ctx).is_file()
 
 
+def completion(ctx):
+    """The runtime can be installed before the operator configures a site."""
+    if not _configured(ctx):
+        return "runtime installed; site not configured yet"
+    return None
+
+
 @contextmanager
 def lock(ctx):
-    """The site lock (site.lock beside config.toml, as site_layout.site_lock
-    takes it) for the whole deploy, taken right after the deploy's own lock: a
-    site change (setup, --site-extend, pirate-add, uninstall, ...) and a deploy
-    of the Crocodile refuse each other instead of overlapping. Like the site
-    commands it never waits. A host without a site has no lock file: nothing to
-    hold, and nothing is created."""
-    path = _config(ctx).parent / "site.lock"
-    try:
-        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except FileNotFoundError:
-        fd = None
-    try:
-        if fd is not None:
-            info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1
-                    or info.st_mode & 0o077):
-                raise boring_deploy.Failure(f"unsafe site lock: {path}")
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise boring_deploy.Failure(f"a change to the site is running ({path} is held)",
-                                            "retry when it has finished") from None
+    """Take the site's canonical lock; a fresh host creates nothing."""
+    state = _config(ctx).parent
+    if not os.path.lexists(state / SITE_LOCK):
         yield
-    finally:
-        if fd is not None:
-            os.close(fd)
+        return
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(site_lock(state, owner=os.geteuid()))
+        except ValueError as error:
+            raise boring_deploy.Failure(str(error)) from None
+        yield
 
 
 def units(ctx):
@@ -92,20 +85,130 @@ def data_generation(ctx):
     store = Path(tomllib.loads(_config(ctx).read_text())["auth"]["oauth_database_file"])
     if not store.is_file():
         return None
-    with closing(sqlite3.connect(f"file:{store}?mode=ro", uri=True)) as db:
+    with closing(sqlite3.connect(store.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         return db.execute("PRAGMA user_version").fetchone()[0]
 
 
+
+def _stopped(ctx):
+    """Read-only proof covering the listener, workers, sockets and task instances."""
+    result = ctx.run("systemctl", "list-units", "--all", "--plain", "--no-legend",
+                     "--no-pager", "boring-crocodile-*")
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or fields[2] not in {"inactive", "failed"}:
+            raise boring_deploy.Failure(
+                "offline adoption/stopped state requires all Crocodile units stopped",
+                "finish jobs; stop the listener, target, workers and task units; verify again")
+
+
+_SITE_STATE = """import os, sys
+from pathlib import Path
+
+release = Path(sys.argv[1])
+sys.path[:0] = [str(wheel) for wheel in sorted((release / "wheels").glob("*.whl"))]
+from boring_crocodile.site_model import LegacyDescription, SiteDescription
+try:
+    site = SiteDescription.read(Path(sys.argv[2]), owner=os.geteuid())
+except LegacyDescription:
+    print("legacy")
+except (OSError, ValueError, KeyError) as error:
+    sys.exit(str(error))
+else:
+    print(site.state)
+"""
+
+
+def preflight(ctx):
+    """Read the complete description with the verified candidate before prepare."""
+    if _configured(ctx):
+        result = ctx.run(sys.executable, "-I", "-B", "-c", _SITE_STATE,
+                         str(ctx.release.directory), str(_config(ctx)), check=False)
+        if result.returncode:
+            return [(result.stderr or result.stdout).strip() or f"cannot validate {_config(ctx)}"]
+        state = result.stdout.strip()
+        if state == "legacy":
+            return [f"{_config(ctx)}: legacy site configuration: use this release's adopt-site.py --dry-run, "
+                    "take the reviewed snapshot and convert while stopped before deploying"]
+        if state in {"stopped", "removed"}:
+            _stopped(ctx)
+        elif state != "running":
+            return [f"{_config(ctx)}: candidate description check returned an unexpected result"]
+    # Receipt storage belongs to each worker; root never opens Pond-owned databases.
+    return []
+
+
+def _description_reader(ctx, release_dir):
+    """Probe this release without asking it to parse the live description."""
+    python = str(Path(release_dir) / "bin" / "python3")
+    result = ctx.run(python, "-I", "-B", "-c",
+                     "import importlib.util; print(int(importlib.util.find_spec('boring_crocodile.site_model') is not None))")
+    answer = result.stdout.strip()
+    if answer not in {"0", "1"}:
+        raise boring_deploy.Failure(f"cannot determine Crocodile description support in {release_dir}")
+    return answer == "1"
+
+
+def way_back(ctx, previous):
+    """Description adoption needs the matching legacy files as well as code."""
+    if _description_reader(ctx, previous):
+        return None
+    version = (Path(previous) / "VERSION").read_text().strip()
+    return (f"back to {version}: follow OPERATIONS.md, section 'Way back across adoption' "
+            "(restore the matching legacy files and runtime)")
+
+
+def _legacy_reader(ctx):
+    """Keep the stopped-adoption proof separate from the release capability."""
+    if _description_reader(ctx, ctx.home / "current"):
+        return False
+    raw = tomllib.loads(_config(ctx).read_text())
+    if raw.get("site", {}).get("schema") != 1 or raw["site"].get("state") != "stopped":
+        raise boring_deploy.Failure("the legacy runtime can cross to a typed description only while stopped",
+                                    "use the one-time importer and the reviewed adoption runbook")
+    _stopped(ctx)
+    return True
+
 def backup(ctx, directory):
-    """With the installed release, as its own command does it (integrity-checked)."""
+    """Consistent generation-5 backup; the old reader cannot read converted config."""
     target = Path(directory) / "oauth.sqlite3"
-    _admin(ctx, ctx.home / "current", "oauth", "backup", "--output", str(target))
+    installed = ctx.home / "current"
+    source = ctx.new if not (installed / "bin/boring-crocodile-admin").exists() or _legacy_reader(ctx) else installed
+    _admin(ctx, source, "oauth", "backup", "--output", str(target))
     return target
+
+
+def _unreadable_description(ctx, installed):
+    """Confirm a failed status came from the installed reader, not host observation."""
+    probe = """import json, sys
+from pathlib import Path
+from boring_crocodile.settings import Settings
+try:
+    Settings.load(Path(sys.argv[1]))
+except (ValueError, KeyError) as error:
+    print(json.dumps({"unreadable": f"{type(error).__name__}: {error}"}))
+else:
+    print("{}")
+"""
+    try:
+        result = ctx.run(str(installed / "bin/python3"), "-I", "-B", "-c", probe,
+                         str(_config(ctx)), check=False)
+        if result.returncode != 0:
+            return None
+        report = json.loads(result.stdout)
+    except (OSError, ValueError):
+        return None
+    reason = report.get("unreadable") if isinstance(report, dict) else None
+    return reason if isinstance(reason, str) and reason else None
 
 
 def check(ctx):
     """The new code reads the live configuration; the installed release's own
-    status is recorded, so smoke can tell a new failure from an old one."""
+    status is informational when its reader cannot parse the live description.
+    Unknown before-state requires every new-release smoke check to pass."""
+    global _before_unknown
+    _before.clear()
+    _before_unknown = None
     if not _configured(ctx):
         ctx.log(f"no {_config(ctx)} yet: installing only; then run {ctx.home}/current/bin/boring-crocodile-setup --wizard")
         return
@@ -113,7 +216,16 @@ def check(ctx):
     ctx.log(f"configuration parses with the new release: {len(json.loads(ponds))} Ponds")
     _render_due(ctx)
     if (ctx.home / "current" / "bin" / "boring-crocodile-admin").exists():
-        _before.update(_checks(ctx, ctx.home / "current"))
+        _legacy_reader(ctx)  # retain the stopped-adoption safety proof
+        installed = ctx.home / "current"
+        try:
+            _before.update(_checks(ctx, installed))
+        except boring_deploy.Failure:
+            reason = _unreadable_description(ctx, installed)
+            if reason is None:
+                raise
+            _before_unknown = reason
+            ctx.log("installed before-state is unknown: " + reason)
 
 
 def _render_due(ctx):
@@ -125,24 +237,23 @@ def _render_due(ctx):
         report = json.loads(result.stdout)
     except ValueError:
         return
-    due = [item["path"] for item in report.get("irregular", [])
-           if item.get("what") in ("differs from the Crocodile's template", "file missing") and "path" in item]
-    if due:
-        ctx.log(f"{len(due)} site files differ from what the new release renders "
-                f"({', '.join(Path(p).name for p in due[:4])}{', ...' if len(due) > 4 else ''}); "
-                "the deploy changes none: afterwards, boring-crocodile-setup --site-render shows the plan")
+    if report.get("status") == "irregular":
+        ctx.log("site-check reports irregular site state with the new release; "
+                "the deploy changes no site files: afterwards, "
+                "boring-crocodile-setup --site-render shows the plan")
 
 
 def healthy(ctx):
     """The running release passed all its status checks right before the switch
-    (recorded by check); it then becomes previous. None when there was none."""
-    return all(_before.values()) if _before else None
+    (recorded by check); it then becomes previous. None when absent or unreadable."""
+    return all(_before.values()) if _before and _before_unknown is None else None
 
 
 def smoke(ctx):
     """Every status check that passed before the switch passes after it
     (workers need a moment to open their sockets: up to a minute), and the
-    controller runs, whatever it did before: a deploy over a broken site said
+    controller runs. An unknown before-state requires every new check to pass.
+    A deploy over a broken site once said
     "is live" with the controller dead."""
     if not _configured(ctx):
         return
@@ -150,8 +261,11 @@ def smoke(ctx):
     while True:
         after = _checks(ctx, ctx.home / "current")
         # A check the new release no longer has is not a failure (it is reported below).
-        lost = sorted(k for k, v in _before.items() if v and k in after and not after[k])
-        if not after.get("site.controller", True) and "site.controller" not in lost:
+        if _before_unknown is not None:
+            lost = sorted(k for k, passed in after.items() if not passed)
+        else:
+            lost = sorted(k for k, v in _before.items() if v and k in after and not after[k])
+        if not after.get("site.controller", _before_unknown is None) and "site.controller" not in lost:
             lost.append("site.controller")
         if not lost:
             break

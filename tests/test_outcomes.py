@@ -15,7 +15,7 @@ from boring_worker_kit.file_policy import FilePolicy
 from boring_worker_kit.framing import read_frame, write_frame
 from boring_worker_kit.host_limits import HostLimits
 from boring_crocodile.jobs import ManagedJobs
-from boring_crocodile.outcomes import OUR_CODES, FailureReport, Refusal, RefusalError, refuse
+from boring_crocodile.outcomes import OUR_CODES, FailureReport, Refused, RefusalError, refuse
 from boring_worker_kit.process import run_process
 from boring_crocodile.settings import EnvironmentSettings
 from boring_crocodile.worker import WorkerServer
@@ -24,52 +24,52 @@ from boring_crocodile.worker_client import WorkerClient, _response_result
 
 class RefusalDataTest(unittest.TestCase):
     def test_refusal_data_and_code_shape(self):
-        refusal = Refusal("stale", "stale edit: file changed", current_sha256=None)
-        self.assertEqual(refusal.as_data(), {"code": "stale", "message": "stale edit: file changed",
+        refusal = Refused("stale", "stale edit: file changed", current_sha256=None)
+        self.assertEqual(refusal.as_data(), {"status": "refused", "code": "stale", "message": "stale edit: file changed",
                                              "current_sha256": None})
         self.assertEqual(refusal.code, "stale")
         # Downstream codes pass through; only the shape is checked.
-        self.assertEqual(Refusal("idempotency_conflict", "x").code, "idempotency_conflict")
+        self.assertEqual(Refused("idempotency_conflict", "x").code, "idempotency_conflict")
         for bad in ("", "Busy", "9lives", "has-dash", "x" * 65):
             with self.subTest(code=bad), self.assertRaises(ValueError):
-                Refusal(bad, "message")
-        self.assertEqual(set(OUR_CODES), {"invalid_request", "not_found", "forbidden",
-                                          "stale", "busy", "limit", "not_admitted",
-                                          "unavailable"})
+                Refused(bad, "message")
+        self.assertEqual(set(OUR_CODES), {"invalid_request", "not_found", "forbidden", "stale", "busy", "locked",
+            "limit", "not_admitted", "unavailable", "timeout", "unsupported", "unreadable",
+            "conflict", "bad_reply", "cleanup_unconfirmed", "upstream_error"})
 
     def test_refusal_error_text_is_compact_json_with_the_code(self):
         error = refuse("forbidden", "This connection cannot access that environment")
         self.assertIsInstance(error, ToolError)
-        self.assertEqual(str(error), '{"code":"forbidden","message":"This connection cannot access that environment"}')
+        self.assertEqual(str(error), '{"status":"refused","code":"forbidden","message":"This connection cannot access that environment"}')
         self.assertEqual(json.loads(str(error))["code"], "forbidden")
         self.assertEqual(error.code, "forbidden")
-        self.assertEqual(json.loads(str(RefusalError({"code": "busy", "message": "ünïcode"})))["message"],
+        self.assertEqual(json.loads(str(RefusalError({"status": "refused", "code": "busy", "message": "ünïcode"})))["message"],
                          "ünïcode")
 
     def test_worker_response_is_exactly_one_shape(self):
         self.assertEqual(_response_result({"ok": True, "result": {"x": 1}}), {"x": 1})
         with self.assertRaises(RefusalError) as caught:
-            _response_result({"ok": False, "refusal": {"code": "busy", "message": "later", "n": 1}})
-        self.assertEqual(caught.exception.data, {"code": "busy", "message": "later", "n": 1})
+            _response_result({"ok": False, "refusal": {"status": "refused", "code": "busy", "message": "later", "n": 1}})
+        self.assertEqual(caught.exception.data, {"status": "refused", "code": "busy", "message": "later", "n": 1})
         with self.assertRaises(FailureReport) as failed:
-            _response_result({"ok": False, "failure": "ValueError: boom"})
+            _response_result({"ok": False, "failure": {"status": "failed", "code": "worker_failed", "message": "ValueError: boom"}})
         # Reported with its explanation, never as a refusal.
-        self.assertEqual(json.loads(str(failed.exception)), {"failure": "ValueError: boom"})
+        self.assertEqual(json.loads(str(failed.exception)), {"status": "failed", "code": "worker_failed", "message": "ValueError: boom"})
         self.assertNotIsInstance(failed.exception, RefusalError)
         for bad in ({"ok": False, "error": "x", "error_code": "busy"},
-                    {"ok": False, "refusal": {"code": "busy"}},
-                    {"ok": False, "refusal": {"code": "Bad Code", "message": "x"}},
-                    {"ok": False, "refusal": {"code": "busy", "message": "x"}, "failure": "y"},
+                    {"ok": False, "refusal": {"status": "refused", "code": "busy"}},
+                    {"ok": False, "refusal": {"status": "refused", "code": "Bad Code", "message": "x"}},
+                    {"ok": False, "refusal": {"status": "refused", "code": "busy", "message": "x"}, "failure": "y"},
                     {"ok": True, "result": []}, {"ok": True}, {}):
             with self.subTest(bad=bad), self.assertRaisesRegex(FailureReport, "invalid worker response"):
                 _response_result(bad)
 
-    def test_unreachable_worker_is_a_reported_failure(self):
+    def test_unreachable_worker_is_refused(self):
         settings = type("S", (), {"socket_path": Path("/nonexistent/worker.sock")})()
         client = WorkerClient({"pond": settings})
-        with self.assertRaises(FailureReport) as caught:
+        with self.assertRaises(RefusalError) as caught:
             asyncio.run(client.request("pond", "limits"))
-        self.assertIn("nothing was sent", json.loads(str(caught.exception))["failure"])
+        self.assertIn("nothing was sent", json.loads(str(caught.exception))["message"])
 
 
 class WorkerBoundaryTest(unittest.IsolatedAsyncioTestCase):
@@ -107,16 +107,16 @@ class WorkerBoundaryTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.worker.files, "_call", bug), \
                 self.assertLogs("boring_crocodile.worker", "ERROR"):
             raw = await self.raw({"operation": "file_read", "root": "work", "path": "x"})
-        self.assertEqual(raw, {"ok": False, "failure": "ValueError: internal invariant broken"})
+        self.assertEqual(raw, {"ok": False, "failure": {"status": "failed", "code": "worker_failed", "message": "ValueError: The Worker failed; see its log for details.", "component": "worker", "effects": "unknown"}})
         with patch.object(self.worker.files, "_call", bug), \
                 self.assertLogs("boring_crocodile.worker", "ERROR"), \
-                self.assertRaisesRegex(RuntimeError, "internal invariant broken") as caught:
+                self.assertRaisesRegex(RuntimeError, "see its log for details") as caught:
             await self.client.file_call("test", "file_read", root="work", path="x")
         # The caller gets the failure with its explanation, never as a refusal.
         self.assertIsInstance(caught.exception, FailureReport)
         self.assertNotIsInstance(caught.exception, RefusalError)
         self.assertEqual(json.loads(str(caught.exception)),
-                         {"failure": "ValueError: internal invariant broken"})
+                         {"status": "failed", "code": "worker_failed", "message": "ValueError: The Worker failed; see its log for details.", "component": "worker", "effects": "unknown"})
 
     async def test_missing_operation_is_refused_and_never_runs_a_command(self):
         self.worker.executor = EnvironmentExecutor(self.settings, HostLimits(1, None))
@@ -126,7 +126,7 @@ class WorkerBoundaryTest(unittest.IsolatedAsyncioTestCase):
                             {"operation": 7, "command": "true"}):
                 with self.subTest(request=request):
                     raw = await self.raw(request)
-                    self.assertEqual(raw, {"ok": False, "refusal": {
+                    self.assertEqual(raw, {"ok": False, "refusal": {"status": "refused",
                         "code": "invalid_request", "message": "operation is required"}})
         execute.assert_not_called()
         self.assertFalse((self.root / "should-not-exist").exists())
@@ -156,5 +156,6 @@ class SpawnFailureTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 jobs.store.close()
         self.assertEqual(output["state"], "failed")
-        self.assertIn("command could not be started", output["result"]["error"])
+        self.assertEqual(output["result"]["failure"]["message"],
+                         "RuntimeError: The Worker failed; see its log for details.")
         self.assertNotIn("exit_code", output["result"])

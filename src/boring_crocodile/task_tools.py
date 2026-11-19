@@ -89,8 +89,8 @@ def register_task_tools(mcp: MCPServer, workers: WorkerClient,
         timeout: the Pirate's default; overrides only for a flavour that allows
         them, see pirate_describe). `cwd` applies only to a command.
         timeout_seconds: default 120 for a command, 600 for operations, at
-        most 86400; pond_limits shows a lower host cap for commands. Then
-        job_wait, job_status, job_output (the job's `result`), job_stop. Every
+        most 86400; bootstrap capabilities show a lower host cap for commands. Then
+        job_wait, job_output (the job's `result`), job_stop. Every
         call starts a new job; if one fails without an answer, check job_list
         before starting it again.
         """
@@ -126,12 +126,6 @@ def register_task_tools(mcp: MCPServer, workers: WorkerClient,
         Lists recent Pond job IDs and states, without results.
         """
         return await workers.list_jobs(command_environment(), limit)
-
-    @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False,
-                                           idempotent_hint=True, open_world_hint=False))
-    async def job_status(job_id: str) -> dict[str, object]:
-        """Check on a job. Still swimming, or done? Use the job_id job_start returned."""
-        return await workers.job_action(command_environment(), "job_status", job_id)
 
     @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False,
                                            idempotent_hint=True, open_world_hint=False))

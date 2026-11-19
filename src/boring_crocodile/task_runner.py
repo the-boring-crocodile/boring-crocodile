@@ -14,7 +14,7 @@ def main() -> None:
     args = parser.parse_args()
     if os.getuid() == 0:
         raise SystemExit("Task runners must use a fixed ordinary identity, never root")
-    settings = Settings.load(args.config).environments[args.environment]
+    settings = Settings.load(args.config, environment=args.environment).environments[args.environment]
     asyncio.run(serve(settings))
 
 

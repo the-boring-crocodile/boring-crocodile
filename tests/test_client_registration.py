@@ -13,7 +13,7 @@ from boring_service_kit.issuer.store import Transaction
 
 from boring_crocodile.control_plane import create_http_app
 from boring_crocodile.settings import Settings
-from pond_config import PROFILE_ID, one_pond_toml
+from pond_config import PROFILE_ID, one_pond_toml, runtime_settings
 
 CLAUDE = "https://claude.ai/oauth/test-client.json"
 CALLBACK = "https://claude.ai/api/mcp/auth_callback"
@@ -25,9 +25,9 @@ class ClientRegistrationTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         root.chmod(0o700)
-        (root / "secret").write_text("pond-approval")
+        (root / "secret").write_text("pond-approval-secret-for-tests")
         (root / "config.toml").write_text(one_pond_toml(root))
-        self.settings = Settings.load(root / "config.toml")
+        self.settings = runtime_settings(root / "config.toml")
         self.mcp, self.app = create_http_app(self.settings)
         self.provider = self.mcp._auth_server_provider
         self.fetched = []
@@ -50,7 +50,7 @@ class ClientRegistrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 302, response.text)
         query = urlsplit(response.headers["location"]).query
         page = (await self.http.get("/approve?" + query)).text
-        approved = await self.http.post("/approve?" + query, data={"secret": "pond-approval"})
+        approved = await self.http.post("/approve?" + query, data={"secret": "pond-approval-secret-for-tests"})
         self.assertEqual(approved.status_code, 302, approved.text)
         code = parse_qs(urlsplit(approved.headers["location"]).query)["code"][0]
         form = {"grant_type": "authorization_code", "code": code, "redirect_uri": redirect, "client_id": client_id,
@@ -87,12 +87,11 @@ class ClientRegistrationTest(unittest.IsolatedAsyncioTestCase):
         from async_lifespan import start_lifespan
         await start_lifespan(self, self.app.router.lifespan_context(self.app))
 
-    async def profile_status(self, token):
+    async def transport_status(self, token):
         from boring_service_kit.testing import mcp_headers, mcp_meta
         return await self.http.post("/mcp/pond",
-            headers=mcp_headers("tools/call", "pond_profile", token),
-            json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                  "params": {"name": "pond_profile", "arguments": {}, "_meta": mcp_meta()}})
+            headers=mcp_headers("tools/list", token=token),
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": mcp_meta()}})
 
     async def public_revocation(self, client_id, redirect):
         await self.start_transport()
@@ -100,23 +99,24 @@ class ClientRegistrationTest(unittest.IsolatedAsyncioTestCase):
         with Transaction(self.settings.oauth_database_file) as db:
             other = add_client(db, "Other public client", [CALLBACK])["client_id"]
         _, kept = await self.sign_in(other, CALLBACK)
-        before = await self.profile_status(tokens["access_token"])
+        before = await self.transport_status(tokens["access_token"])
         self.assertEqual(before.status_code, 200)
-        self.assertEqual(before.json()["result"]["structuredContent"]["id"], PROFILE_ID)
+        self.assertIn("pond_bootstrap", {tool["name"] for tool in before.json()["result"]["tools"]})
+        self.assertEqual((await self.provider.load_access_token(tokens["access_token"])).subject, PROFILE_ID)
         form = {"client_id": client_id, "token": tokens["refresh_token"],
                 "token_type_hint": "refresh_token"}
         # A public client cannot revoke another client's grant.
         wrong = await self.http.post("/revoke", data={**form, "client_id": other})
         self.assertEqual(wrong.status_code, 200)
-        self.assertEqual((await self.profile_status(tokens["access_token"])).status_code, 200)
+        self.assertEqual((await self.transport_status(tokens["access_token"])).status_code, 200)
         revoked = await self.http.post("/revoke", data=form)
         self.assertEqual(revoked.status_code, 200, revoked.text)
-        self.assertEqual((await self.profile_status(tokens["access_token"])).status_code, 401)
+        self.assertEqual((await self.transport_status(tokens["access_token"])).status_code, 401)
         refresh = await self.http.post("/token", data={
             "grant_type": "refresh_token", "client_id": client_id, "refresh_token": tokens["refresh_token"]})
         self.assertEqual(refresh.status_code, 400)
         self.assertEqual(refresh.json()["error"], "invalid_grant")
-        self.assertEqual((await self.profile_status(kept["access_token"])).status_code, 200)
+        self.assertEqual((await self.transport_status(kept["access_token"])).status_code, 200)
         self.assertEqual((await self.http.post("/revoke", data=form)).status_code, 200)
         self.assertEqual((await self.http.post("/revoke", data={**form, "token": "unknown"})).status_code, 200)
         metadata = (await self.http.get("/.well-known/oauth-authorization-server")).json()
@@ -152,14 +152,14 @@ class ClientRegistrationTest(unittest.IsolatedAsyncioTestCase):
             refused = await self.http.post("/revoke", data=data, headers=head)
             self.assertEqual(refused.status_code, 401)
             self.assertNotIn(secret, refused.text)
-            self.assertEqual((await self.profile_status(tokens["access_token"])).status_code, 200)
+            self.assertEqual((await self.transport_status(tokens["access_token"])).status_code, 200)
         data = dict(form)
         if auth == "client_secret_post":
             data["client_secret"] = secret
         head = headers(secret) if auth == "client_secret_basic" else {}
         revoked = await self.http.post("/revoke", data=data, headers=head)
         self.assertEqual(revoked.status_code, 200, revoked.text)
-        self.assertEqual((await self.profile_status(tokens["access_token"])).status_code, 401)
+        self.assertEqual((await self.transport_status(tokens["access_token"])).status_code, 401)
         refresh_form = {"grant_type": "refresh_token", "client_id": client,
                         "refresh_token": tokens["refresh_token"]}
         if auth == "client_secret_post":

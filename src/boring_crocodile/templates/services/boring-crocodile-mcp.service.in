@@ -3,7 +3,8 @@ PartOf=boring-crocodile-mcp.target
 Description=Boring Crocodile MCP control plane
 After=network-online.target boring-crocodile-worker-@POND@.service
 Wants=network-online.target
-Requires=boring-crocodile-worker-@POND@.service
+Requires=boring-crocodile-worker-@POND@.service boring-crocodile-mcp.socket
+After=boring-crocodile-mcp.socket
 
 [Service]
 Type=simple

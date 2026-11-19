@@ -1,10 +1,11 @@
 [Unit]
 PartOf=boring-crocodile-mcp.target
-Description=Boring Crocodile shared @POND@ command budget
+Description=Boring Crocodile shared @POND@ worker and command budget
 [Slice]
 MemoryAccounting=yes
 TasksAccounting=yes
 MemoryMax=@MEMORY@
 MemorySwapMax=@SWAP@
 TasksMax=@TASKS@
+@SOCKET_BIND_DENY@
 # No CPUQuota or MemoryHigh: emergency ceilings, no routine throttling.

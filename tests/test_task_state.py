@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 
-from boring_crocodile.task_state import ReceiptStore, decode_metadata, decode_result
+from boring_crocodile.task_state import ReceiptStore, TERMINAL_STATES, decode_metadata, decode_result
 
 HEX32 = re.compile(r"[a-f0-9]{32}\Z")
 
@@ -48,6 +48,7 @@ class StoreTest(unittest.TestCase):
             store.list(0)
         store.close()
         self.assertEqual(user_version(self.path), 1)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
     def test_schema_has_no_key_digest_owner(self):
         store = ReceiptStore(self.path, "jobs")
@@ -100,10 +101,30 @@ class StoreTest(unittest.TestCase):
             self.path.unlink(missing_ok=True)
             self._legacy(table_sql, [])
             before = self.path.read_bytes()
-            with self.assertRaisesRegex(ValueError, "unsupported schema.*database left unchanged"):
+            with self.assertRaisesRegex(ValueError, "unsupported receipt schema.*database left unchanged"):
                 ReceiptStore(self.path, "jobs")
             self.assertEqual(self.path.read_bytes(), before)
             self.assertEqual(user_version(self.path), 0)
+
+    def test_existing_schema_zero_even_matching_or_empty_is_refused_unchanged(self):
+        for kind in ("empty-file", "empty-table", "populated"):
+            with self.subTest(kind=kind):
+                self.path.unlink(missing_ok=True)
+                if kind == "empty-file":
+                    self.path.touch()
+                else:
+                    store = ReceiptStore(self.path, "jobs")
+                    if kind == "populated":
+                        store.create("completed")
+                    store.db.execute("PRAGMA user_version=0")
+                    store.close()
+                before = (self.path.read_bytes(), self.path.stat().st_mtime_ns)
+                with self.assertRaisesRegex(ValueError, "archive/remove"):
+                    ReceiptStore(self.path, "jobs")
+                self.assertEqual((self.path.read_bytes(), self.path.stat().st_mtime_ns), before)
+
+    def test_terminal_vocabulary_has_no_timeout_state(self):
+        self.assertNotIn("timed_out", TERMINAL_STATES)
 
     def test_future_schema_is_refused_without_modification(self):
         store = ReceiptStore(self.path, "jobs")

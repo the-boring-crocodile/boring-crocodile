@@ -1,195 +1,230 @@
-import json
+"""Provisioning boundary logic; journeys use the same synthetic host."""
+from dataclasses import replace
+from functools import partial
 import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from boring_crocodile.setup import SetupInputs, inspect, plan_digest
-from boring_crocodile.setup_apply import Host, SetupConflict, apply
+from boring_deploy import root_input
+from boring_crocodile.setup import SetupInputs
+from boring_crocodile import setup_apply as provision
+from boring_crocodile.site_model import SiteDescription
+from site_host import FakeHost
 
-class FakeHost(Host):
-    def __init__(self, root):
-        super().__init__(root)
-        self.owner = os.getuid()
-        self.users = {}
-        self.groups = {}
-        self.calls = []
-        self.fail_group = None
-        for name in ("etc", "srv", "home"):
-            (root/name).mkdir(mode=0o755)
-    def require_authority(self):
-        pass
-    def account(self, name):
-        return self.users.get(name)
-    def group(self, name):
-        return self.groups.get(name)
-    def create_group(self, name):
-        if name == self.fail_group:
-            raise RuntimeError("Injected failure")
-        self.calls.append(("group", name))
-        self.groups[name] = {"name": name, "gid": 2000+len(self.groups)}
-    def create_user(self, name, home, access):
-        self.calls.append(("user", name))
-        self.users[name] = dict(name=name, uid=3000+len(self.users),
-                               gid=self.groups[name]["gid"], home=home,
-                               shell="/usr/sbin/nologin")
-    def chown(self, path, uid, gid):
-        self.calls.append(("chown", str(path), uid, gid))
-    def memberships(self, name, gid):
-        return sorted({gid, self.groups["test-worker"]["gid"]}) if name == "test-control" else [gid]
-    def fresh_plan(self, inputs):
-        with patch("boring_crocodile.setup.account", side_effect=self.account), patch("boring_crocodile.setup.group", side_effect=self.group):
-            return inspect(inputs, self.path("/etc/boring-crocodile/config.toml"))
 
-class ApplyTest(unittest.TestCase):
+class ProvisionCase(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
-        self.host = FakeHost(self.root)
-        self.inputs = SetupInputs.parse(dict(execution_user="test-worker",
-            control_user="test-control", home="/home/test-worker", context_mode="starter",
-            context_source=None, context_files=[]))
-        self.digest = plan_digest(self.host.fresh_plan(self.inputs))
-    def tearDown(self):
-        self.temp.cleanup()
-    def test_initial_apply_and_repeat_preserve_editable_agreement(self):
-        result = apply(self.inputs, self.digest, host=self.host)
-        self.assertEqual(result["status"], "complete")
-        self.assertEqual(set(self.host.groups), {"test-worker", "test-control"})
-        published = self.host.path("/srv/boring-crocodile/context-initial/HANDBOOK.md")
-        editable = self.host.path("/home/test-worker/handbook/HANDBOOK.md")
-        self.assertFalse(published.exists())
-        self.assertTrue(editable.is_file())
-        self.assertTrue((editable.parent / "WELCOME.md").is_file())
-        self.assertEqual(result["context_root"], "/home/test-worker/handbook")
-        receipt_path = self.host.path("/etc/boring-crocodile/initial-setup.json")
-        profile_id = json.loads(receipt_path.read_text())["profile_id"]
-        from uuid import UUID
-        self.assertEqual(str(UUID(profile_id)), profile_id)
-        self.assert_seeded_on_disk(result)
-        editable.write_text("our evolved agreement")
-        before = len(self.host.calls)
-        repeat_digest = plan_digest(self.host.fresh_plan(self.inputs))
-        self.assertNotEqual(repeat_digest, self.digest)
-        result = apply(self.inputs, repeat_digest, host=self.host)
-        self.assertEqual(result["status"], "already_complete")
-        self.assertEqual(editable.read_text(), "our evolved agreement")
-        self.assertEqual(len(self.host.calls), before)
-        self.assertEqual(json.loads(receipt_path.read_text())["profile_id"], profile_id)
-    def assert_seeded_on_disk(self, result):
-        from boring_crocodile.instructions import WELCOME
-        mode = lambda path: path.lstat().st_mode & 0o777
-        starter = Path(__file__).resolve().parent.parent / "src/boring_crocodile/templates/HANDBOOK.md"
-        home = self.host.path("/home/test-worker")
-        handbook = home / "handbook"
-        self.assertEqual((handbook / "HANDBOOK.md").read_bytes(), starter.read_bytes())
-        self.assertEqual((handbook / "WELCOME.md").read_bytes(), WELCOME.encode())
-        for directory in (home, handbook, home / "work", home / "lab"):
-            self.assertEqual(mode(directory), 0o700, directory)
-        for name in ("HANDBOOK.md", "WELCOME.md"):
-            self.assertEqual(mode(handbook / name), 0o600, name)
-        receipt_path = self.host.path("/etc/boring-crocodile/initial-setup.json")
-        receipt = json.loads(receipt_path.read_text())
-        self.assertEqual(receipt["status"], "complete")
-        self.assertEqual(mode(receipt_path), 0o600)
-        worker = self.host.users["test-worker"]
-        self.assertEqual((result["execution_uid"], receipt["users"]["test-worker"]), (worker["uid"], worker))
-        chowned = {path: (uid, gid) for kind, path, *ids in self.host.calls if kind == "chown" for uid, gid in [ids]}
-        expected = {str(p) for p in (home, handbook, home / "work", home / "lab",
-                                     handbook / "HANDBOOK.md", handbook / "WELCOME.md")}
-        self.assertEqual(set(chowned), expected)
-        self.assertEqual(set(chowned.values()), {(worker["uid"], worker["gid"])})
-        self.assertEqual(self.host.calls[-1][:2], ("chown", str(home)))
+        self.enterContext(patch("boring_crocodile.setup.root_input",
+                                side_effect=partial(root_input, owner=os.getuid())))
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.host = FakeHost(Path(self.directory.name), provisioned=False)
+        self.inputs = SetupInputs.parse(dict(execution_user="demo-pond", control_user="demo-control",
+            home="/home/demo-pond", context_mode="starter", context_source=None, context_files=[]))
 
-    def test_changed_plan_refused_before_writes(self):
-        with self.assertRaises(SetupConflict):
-            apply(self.inputs, "wrong", host=self.host)
-        self.assertEqual(self.host.calls, [])
-        self.assertFalse(self.host.path("/etc/boring-crocodile").exists())
-    def test_existing_installation_refused(self):
-        state = self.host.path("/etc/boring-crocodile");state.mkdir()
-        config = state/"config.toml";config.write_text("live")
-        with self.assertRaises(SetupConflict):
-            apply(self.inputs, self.digest, host=self.host)
-        self.assertEqual(config.read_text(), "live")
-        self.assertEqual(self.host.calls, [])
-    def test_partial_account_setup_requires_explicit_resume(self):
-        self.host.fail_group = "test-control"
-        with self.assertRaises(RuntimeError):
-            apply(self.inputs, self.digest, host=self.host)
-        self.host.fail_group = None
-        with self.assertRaises(SetupConflict):
-            apply(self.inputs, self.digest, host=self.host)
-        result = apply(self.inputs, self.digest, resume=True, host=self.host)
-        self.assertEqual(result["status"], "complete")
-        self.assertEqual(self.host.calls.count(("group", "test-worker")), 1)
-    def test_unrecorded_account_operation_is_not_silently_adopted(self):
-        self.host.fail_group = "test-control"
-        with self.assertRaises(RuntimeError):
-            apply(self.inputs, self.digest, host=self.host)
-        self.host.fail_group = None
-        self.host.create_group("test-control")
-        with self.assertRaisesRegex(SetupConflict, "Unrecorded existing group"):
-            apply(self.inputs, self.digest, resume=True, host=self.host)
-    def test_home_symlink_refused(self):
-        self.host.path("/home/test-worker").symlink_to(self.root/"etc")
-        with self.assertRaises(SetupConflict):
-            apply(self.inputs, self.digest, host=self.host)
-        self.assertEqual(self.host.calls, [])
-    def test_import_change_after_plan_is_refused(self):
-        source = self.root/"source";source.mkdir();(source/"contract.md").write_text("first")
-        inputs = SetupInputs.parse(self.inputs.as_input() | dict(context_mode="import",
-                                  context_source=str(source), context_files=["contract.md"]))
-        digest = plan_digest(self.host.fresh_plan(inputs))
-        (source/"contract.md").write_text("second")
-        with self.assertRaises(SetupConflict):
-            apply(inputs, digest, host=self.host)
-        self.assertEqual(self.host.calls, [])
-    def test_nested_import_seeds_selected_files_only(self):
-        source = self.root/"source";source.mkdir()
-        (source/"contract.md").write_text("agreement")
-        (source/"excluded.md").write_text("private unrelated data")
-        (source/"nested").mkdir();(source/"nested/history.md").write_text("history")
-        inputs = SetupInputs.parse(self.inputs.as_input() | dict(context_mode="import",
-            context_source=str(source), context_files=["contract.md", "nested/history.md"]))
-        apply(inputs, plan_digest(self.host.fresh_plan(inputs)), host=self.host)
-        snapshot = self.host.path("/home/test-worker/handbook")
-        self.assertEqual((snapshot/"nested/history.md").read_text(), "history")
-        self.assertFalse((snapshot/"excluded.md").exists())
-        self.assertTrue((source/"excluded.md").exists())
+    def provision(self):
+        proposal = provision.plan(self.inputs, host=self.host)
+        return provision.apply(self.inputs, proposal["plan_digest"], host=self.host)
 
-    def test_resume_refuses_interrupted_ownership_transfer(self):
-        apply(self.inputs, self.digest, host=self.host)
-        path = self.host.path("/etc/boring-crocodile/initial-setup.json")
-        receipt = json.loads(path.read_text());receipt["status"] = "transferring"
-        path.write_text(json.dumps(receipt))
-        before = list(self.host.calls)
-        with self.assertRaisesRegex(SetupConflict, "manual inspection"):
-            apply(self.inputs, self.digest, resume=True, host=self.host)
-        self.assertEqual(before, self.host.calls)
 
-    def test_staged_context_tampering_blocks_resume(self):
-        self.host.fail_group = "test-control"
-        with self.assertRaises(RuntimeError):
-            apply(self.inputs, self.digest, host=self.host)
-        self.host.path("/etc/boring-crocodile/initial-context/0").write_text("changed")
-        before = list(self.host.calls)
-        with self.assertRaises(SetupConflict):
-            apply(self.inputs, self.digest, resume=True, host=self.host)
-        self.assertEqual(self.host.calls, before)
+class ProvisionLogicTest(ProvisionCase):
+    def test_reception_is_provisioned_without_starting_worker_and_kept_on_rerun(self):
+        before = self.host.group("pond-pirates")
+        self.provision()
+        self.assertIsNone(before)
+        created = self.host.group("pond-pirates")
+        self.assertGreater(created["gid"], 0)
+        definition = "d /run/boring-crocodile/guests 0755 root root - -\n" + (
+            "d /run/boring-crocodile/guests/pond 2750 demo-pond pond-pirates - -\n")
+        self.assertIn(["/usr/bin/systemd-tmpfiles", "--create", "-"], self.host.calls)
+        self.assertIn(["stdin", definition], self.host.calls)
+        self.assertFalse(any("systemctl" in item for call in self.host.calls for item in call))
+        site = SiteDescription.read(self.host.paths.config)
+        self.assertNotIn("service_registration_enabled", site.ponds["pond"].document["execution"])
+        self.provision()
+        self.assertEqual(self.host.group("pond-pirates"), created)
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_preview_and_changed_import_are_read_only(self):
+        source = self.host.root / "source"
+        source.mkdir()
+        (source / "nested").mkdir()
+        document = source / "nested/AGREEMENT.md"
+        document.write_text("reviewed")
+        (source / "unselected").write_text("private")
+        self.inputs = replace(self.inputs, context_mode="import", context_source=str(source),
+                              context_files=("nested/AGREEMENT.md",))
+        proposal = provision.plan(self.inputs, host=self.host)
+        self.assertNotIn("reviewed", str(proposal))
+        self.assertFalse(self.host.identities)
+        document.write_text("changed")
+        with self.assertRaisesRegex(ValueError, "changed"):
+            provision.apply(self.inputs, proposal["plan_digest"], host=self.host)
+        self.assertFalse(self.host.identities)
+        self.provision()
+        handbook = self.host.path(self.inputs.home) / "handbook"
+        self.assertEqual((handbook / "nested/AGREEMENT.md").read_text(), "changed")
+        self.assertFalse((handbook / "unselected").exists())
 
-class AccountCommandTest(unittest.TestCase):
-    def test_worker_has_only_primary_group_controller_joins_pond(self):
-        host = Host()
-        with patch("boring_crocodile.setup_apply.subprocess.run") as run:
-            host.create_user("worker", "/home/worker", None)
-            worker_command = run.call_args.args[0]
-            self.assertNotIn("--groups", worker_command)
-            self.assertEqual(worker_command[worker_command.index("--gid") + 1], "worker")
-            host.create_user("controller", "/nonexistent", "worker")
-            controller_command = run.call_args.args[0]
-            self.assertEqual(controller_command[controller_command.index("--groups") + 1], "worker")
+    def test_partial_accounts_and_empty_root_home_need_no_resume(self):
+        actual = self.host.create_user
+        def interrupted(identity):
+            site = SiteDescription.read(self.host.paths.config)
+            self.assertEqual(identity, site.controller if identity.name == "demo-control"
+                             else site.ponds["pond"].identity)
+            if identity.name == "demo-pond":
+                raise OSError("account interruption")
+            actual(identity)
+        with patch.object(self.host, "create_user", interrupted), self.assertRaises(OSError):
+            self.provision()
+        self.assertEqual(set(self.host.identities), {"demo-control"})
+        with patch.object(self.host, "chown", side_effect=OSError("chown interruption")), self.assertRaises(OSError):
+            self.provision()
+        self.provision()
+        self.assertFalse(list(self.host.paths.state.rglob("*.json")))
+
+    def test_identity_home_and_secret_conflicts_fail_before_writes(self):
+        home = self.host.path(self.inputs.home)
+        home.symlink_to(self.host.root / "etc")
+        with self.assertRaises(ValueError):
+            provision.plan(self.inputs, host=self.host)
+        self.assertFalse(self.host.identities)
+        self.assertFalse(self.host.paths.config.exists())
+        home.unlink()
+        self.provision()
+        identity = self.host.identities["demo-pond"]
+        self.host.identities[identity.name] = replace(identity, uid=identity.uid+100)
+        with self.assertRaisesRegex(ValueError, "identity changed"):
+            provision.plan(self.inputs, host=self.host)
+        self.host.identities[identity.name] = identity
+        with patch.object(self.host, "memberships", return_value=[identity.gid, 27]):
+            with self.assertRaisesRegex(ValueError, "authority"):
+                provision.plan(self.inputs, host=self.host)
+        secret = self.host.path(SiteDescription.read(self.host.paths.config).ponds["pond"].credential_file)
+        before = secret.read_bytes()
+        secret.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "approval secret"):
+            provision.plan(self.inputs, host=self.host)
+        self.assertEqual(secret.read_bytes(), before)
+        secret.chmod(0o600)
+        secret.write_text("tiny\n")
+        with self.assertRaisesRegex(ValueError, "at least 24 characters"):
+            provision.plan(self.inputs, host=self.host)
+
+    def test_every_publication_and_identity_cut_reuses_the_declaration(self):
+        # Two declaration publications, four groups, two accounts; no journal.
+        for cut in range(8):
+            for after in (False, True):
+                with self.subTest(cut=cut, after=after):
+                    self.host = FakeHost(Path(self.directory.name) / f"cut-{cut}-{after}", provisioned=False)
+                    actual_write, actual_group, actual_user = provision.write_file, self.host.create_group, self.host.create_user
+                    count = 0
+
+                    def effect(function, *args, **kwargs):
+                        nonlocal count
+                        selected = count == cut
+                        count += 1
+                        if selected and not after:
+                            raise OSError("interrupted before effect")
+                        result = function(*args, **kwargs)
+                        if selected and after:
+                            raise OSError("interrupted after effect")
+                        return result
+
+                    def publish(path, *args, **kwargs):
+                        if path.name == "config.toml":
+                            return effect(actual_write, path, *args, **kwargs)
+                        return actual_write(path, *args, **kwargs)
+
+                    def group(name, gid=None):
+                        site = SiteDescription.read(self.host.paths.config)
+                        self.assertFalse(self.host.active)
+                        self.assertIn(name, {site.controller.group, site.ponds["pond"].identity.group, "pirate-clients", "pond-pirates"})
+                        return effect(actual_group, name, gid)
+
+                    with patch.object(provision, "write_file", publish), patch.object(
+                            self.host, "create_group", group), patch.object(
+                            self.host, "create_user", lambda identity: effect(actual_user, identity)):
+                        with self.assertRaises(OSError):
+                            self.provision()
+                    declaration = self.host.paths.state / "ponds/pond/config.toml"
+                    saved = declaration.read_bytes() if declaration.exists() else None
+                    self.provision()
+                    if saved:
+                        self.assertEqual(declaration.read_bytes(), saved)
+                    site = SiteDescription.read(self.host.paths.config)
+                    self.assertEqual(self.host.identities, {site.controller.name: site.controller,
+                                                           site.ponds["pond"].identity.name: site.ponds["pond"].identity})
+                    self.assertFalse(list(self.host.paths.state.rglob("*.json")))
+
+    def test_occupied_ids_and_undeclared_names_are_not_adopted(self):
+        from boring_crocodile.site_model import Identity
+        for conflict in ("uid", "gid", "user-name", "group-name"):
+            with self.subTest(conflict=conflict):
+                self.host = FakeHost(Path(self.directory.name) / conflict, provisioned=False)
+                proposal = provision.plan(self.inputs, host=self.host)
+                worker = Identity.parse(proposal["accounts"]["worker"]["identity"])
+                if conflict == "uid":
+                    self.host.identities["unrelated"] = replace(worker, name="unrelated", group="unrelated")
+                elif conflict == "gid":
+                    self.host.extra_groups["unrelated"] = {"name": "unrelated", "gid": worker.gid}
+                elif conflict == "user-name":
+                    self.host.identities[worker.name] = worker
+                else:
+                    self.host.extra_groups[worker.group] = {"name": worker.group, "gid": worker.gid}
+                with self.assertRaises(ValueError):
+                    provision.apply(self.inputs, proposal["plan_digest"], host=self.host)
+                self.assertFalse(self.host.paths.config.exists())
+                if conflict in {"user-name", "group-name"}:
+                    with self.assertRaisesRegex(ValueError, "Undeclared"):
+                        provision.plan(self.inputs, host=self.host)
+
+        # Once a binding is published, its IDs cannot be reassigned on retry.
+        for conflict in ("uid", "gid"):
+            with self.subTest(declared_conflict=conflict):
+                self.host = FakeHost(Path(self.directory.name) / ("declared-"+conflict), provisioned=False)
+                with patch.object(self.host, "create_group", side_effect=OSError("interrupted")):
+                    with self.assertRaises(OSError):
+                        self.provision()
+                site = SiteDescription.read(self.host.paths.config)
+                worker = site.ponds["pond"].identity
+                before = self.host.paths.config.read_bytes()
+                if conflict == "uid":
+                    self.host.identities["unrelated"] = replace(worker, name="unrelated", group="unrelated")
+                else:
+                    self.host.extra_groups["unrelated"] = {"name": "unrelated", "gid": worker.gid}
+                with self.assertRaisesRegex(ValueError, "occupied"):
+                    provision.plan(self.inputs, host=self.host)
+                self.assertEqual(self.host.paths.config.read_bytes(), before)
+
+    def test_native_id_limits_and_explicit_account_requests(self):
+        from boring_crocodile.site_host import Host
+        login = self.host.path("/etc/login.defs")
+        login.write_text("UID_MIN 2000\nGID_MIN 3000\nSYS_UID_MIN 500\nSYS_UID_MAX 503\n")
+        self.assertEqual(list(Host.system_id_range(self.host, "UID")), [503, 502, 501, 500])
+        self.assertEqual((Host.system_id_range(self.host, "GID")[0],
+                          Host.system_id_range(self.host, "GID")[-1]), (2999, 101))
+        with patch.object(self.host, "system_id_range", return_value=range(0)):
+            with self.assertRaisesRegex(ValueError, "No free system UID"):
+                provision.plan(self.inputs, host=self.host)
+        login.write_text("SYS_UID_MIN 600\nSYS_UID_MAX 500\n")
+        with self.assertRaisesRegex(ValueError, "Invalid system UID"):
+            Host.system_id_range(self.host, "UID")
+        proposal = provision.plan(self.inputs, host=self.host)
+        from boring_crocodile.site_model import Identity
+        identity = Identity.parse(proposal["accounts"]["worker"]["identity"])
+        with patch.object(self.host, "command") as command:
+            Host.create_group(self.host, identity.group, identity.gid)
+            Host.create_user(self.host, identity)
+        group_command, user_command = [call.args[0] for call in command.call_args_list]
+        self.assertEqual(group_command[group_command.index("--gid")+1], str(identity.gid))
+        self.assertEqual(user_command[user_command.index("--gid")+1], str(identity.gid))
+        self.assertEqual(user_command[user_command.index("--uid")+1], str(identity.uid))
+        self.assertNotIn("--non-unique", user_command)
+        self.assertFalse(self.host.identities)
+        for role in ("execution_user", "control_user"):
+            inputs = replace(self.inputs, **{role: "pirate-clients"},
+                             **({"home": "/home/pirate-clients"} if role == "execution_user" else {}))
+            with self.assertRaisesRegex(ValueError, "role-group"):
+                provision.plan(inputs, host=self.host)

@@ -5,14 +5,14 @@
 
 Installs the locked dependencies (--require-hashes) into a new virtual
 environment, then boring-crocodile from a copy of its
-tracked files (so packaging errors surface). The unit profile
-(tests/run_profile.py) then runs the source tree's tests, importing from src/
-(site/default/generate.py refuses an installed copy), against those installed
-dependencies; then the scoped strict mypy gate (the files under [tool.mypy]).
+tracked files (so packaging errors surface). Pytest runs the source tree's full
+test directory against those installed dependencies. The installed-wheel handbook
+resource check runs in isolation, followed by the scoped strict mypy gate.
 Private names in shipped text are the family export scan's job, not this check's.
 Test tools come from requirements-dev.txt, pinned by version, not by hash.
 Exit status 0 means every step passed.
 """
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -32,7 +32,12 @@ def main():
         python = develop.environment(develop.uv(), args.python, tmp / "venv", [ROOT / "requirements.lock"],
                                      args.common_wheels, packages, ROOT / "scripts/build-constraints.txt",
                                      ["-r", str(ROOT / "requirements-dev.txt")])
-        develop.run(python, ROOT / "tests/run_profile.py", "unit", cwd=ROOT)
+        # Source imports are required by the site generator and test subprocesses.
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(map(str, (ROOT / "src", ROOT / "tests"))))
+        develop.run(python, "-m", "pytest", "-q", "-p", "no:cacheprovider", ROOT / "tests",
+                    cwd=ROOT, env=env)
+        develop.run(python, "-I", ROOT / "tests/test_setup.py",
+                    "SetupTest.test_packaged_handbooks_are_release_resources", cwd=tmp)
         develop.run(python, "-m", "mypy", cwd=ROOT)  # the scoped strict gate: the files under [tool.mypy]
     print("all boring-crocodile checks passed")
     return 0

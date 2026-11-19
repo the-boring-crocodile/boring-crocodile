@@ -47,27 +47,34 @@ and keep in mind they act per Pond (per account), not per command.
 ## Widening: host administration by a Pond
 
 Every Pond starts with `no_new_privileges = true`: a restricted command task.
-A root administrator may set it to `false` for one Pond in its
-`[environments.NAME]` section **and**, separately, give that account sudo.
-Neither happens at install. Such a Pond can change the whole host, other Ponds
-and its own restrictions included; keep work that needs isolation in a
-separate, restricted Pond. The controller and worker stay non-root.
+A root administrator may set it to `false` in the Pond file's `[execution]`
+section and, separately, give that account sudo. Neither happens at install.
+Such a Pond can change the whole host, other Ponds and its own restrictions
+included; keep work that needs isolation in a separate, restricted Pond.
+The controller and worker stay non-root.
 
-Turning off NoNewPrivileges alone does not work (capability and mount
-directives still block root work), so the whole task policy switches as one
-drop-in, rendered by `task_policy.py`:
+Turning off NoNewPrivileges alone does not work: capability and mount
+directives still block root work. Render writes the complete task policy into
+the base task unit from that one setting:
 
-    sudo boring-crocodile-admin task-policy --pond NAME
-    sudo boring-crocodile-admin task-policy --pond NAME --apply --approve-digest DIGEST
+    sudo boring-crocodile-setup --site-render
+    sudo boring-crocodile-setup --site-render --apply
 
-The plan shows the mode, the drop-in path and its directives. Stop the Pond's
-worker first and let its tasks finish; the apply refuses an active worker or
-task. It writes only its own root-owned drop-in, reloads systemd, compares the
-loaded properties and capability set with the policy, and restores the
-previous drop-in if they differ. It refuses conflicting directives in other
-root-owned drop-ins and leaves unrelated ones alone. The worker stays stopped
-for you to start and check. Reversing is the same path with `true`; remove the
-sudo grant separately.
+Let the Pond's current tasks finish before applying a policy change. Review the
+render plan and type `APPLY`; the common render repairs the units and restarts
+the workers/controller. Render accepts and shows every root-owned external
+drop-in verbatim, with a warning for settings also written by the
+description. Keep secrets in files referenced by `LoadCredential=` and
+keep their contents out of drop-ins. Render never
+rewrites or deletes those files; symlinks, masks and unsafe file ownership or
+modes are refused. There is no directive allow-list. systemd owns precedence.
+Site-check and status compare effective task policy with the description;
+a mismatch is irregular/degraded. Reversing follows the same path with `true`;
+remove the conflicting drop-in and sudo grant separately.
+
+The one-time 0.4.21 importer projects an exact old generated
+`50-pond-task-policy.conf` into the description and proposes its removal.
+It refuses foreign content. Ordinary render never removes external drop-ins.
 
 `admin status` compares the same properties (`matches`, `mismatch`,
 `unknown`; `not_applicable` without commands); a mismatch degrades health.

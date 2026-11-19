@@ -13,6 +13,7 @@ import unittest
 
 from boring_crocodile.oauth_admin import OAuthAdmin
 from boring_crocodile.oauth_records import initialize, secret_key, service
+from boring_crocodile.site_layout import site_lock
 from pond_config import PROFILE_ID, dynamic, one_pond
 
 
@@ -45,12 +46,13 @@ class OAuthAdminTest(unittest.TestCase):
                    (kind,key,json.dumps(value), 9999999999, pair))
 
     def test_service_add_list_remove(self):
-        added = self.store.service_add("canvas", "http://127.0.0.1:18511/mcp", ["alpha", "beta"])
-        self.assertEqual(set(added), {"name", "client_id", "client_secret", "url", "ponds", "ping_timeout"})
+        added = self.store.service_add("canvas", "http://127.0.0.1:18511/mcp", {'alpha': 'writer', 'beta': 'writer'}, roles=["reader", "writer"], default_role="reader")
+        self.assertEqual(set(added), {"name", "client_id", "client_secret", "url", "callers", "roles", "default_role", "ping_timeout"})
         self.assertTrue(added["client_id"].startswith("svc_"))
         listed = self.store.service_list()
         self.assertEqual(listed, [{"name": "canvas", "client_id": added["client_id"],
-                                   "url": "http://127.0.0.1:18511/mcp", "ponds": ["alpha", "beta"],
+                                   "url": "http://127.0.0.1:18511/mcp", "callers": {"alpha": "writer", "beta": "writer"},
+                                   "roles": ["reader", "writer"], "default_role": "reader",
                                    "ping_timeout": 1.0}])
         self.assertNotIn(added["client_secret"], self.path.read_bytes().decode("latin-1"))
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -61,13 +63,13 @@ class OAuthAdminTest(unittest.TestCase):
                                                    "scopes": []})
         self.assertEqual(self.store.status()["counts"]["service"], 1)
         with self.assertRaisesRegex(ValueError, "exists"):
-            self.store.service_add("canvas", "http://127.0.0.1:1/mcp", ["alpha"])
-        for name, url, ponds in (("Canvas", "http://h/mcp", ["alpha"]), ("-x", "http://h/mcp", ["alpha"]),
-                                 ("x", "ftp://h/mcp", ["alpha"]), ("x", "/mcp", ["alpha"]),
-                                 ("x", "http://u:p@h/mcp", ["alpha"]), ("x", "http://h/mcp?q", ["alpha"]),
+            self.store.service_add("canvas", "http://127.0.0.1:1/mcp", {'alpha': 'writer'}, roles=["reader", "writer"], default_role="reader")
+        for name, url, ponds in (("Canvas", "http://h/mcp", {"alpha": "writer"}), ("-x", "http://h/mcp", {"alpha": "writer"}),
+                                 ("x", "ftp://h/mcp", {"alpha": "writer"}), ("x", "/mcp", {"alpha": "writer"}),
+                                 ("x", "http://u:p@h/mcp", {"alpha": "writer"}), ("x", "http://h/mcp?q", {"alpha": "writer"}),
                                  ("x", "http://h/mcp", []), ("x", "http://h/mcp", ["alpha", "alpha"])):
             with self.subTest(name=name, url=url, ponds=ponds), self.assertRaises(ValueError):
-                self.store.service_add(name, url, ponds)
+                self.store.service_add(name, url, ponds, roles=["reader", "writer"], default_role="reader")
         self.assertEqual(len(self.store.service_list()), 1)
         self.assertEqual(self.store.service_remove("canvas"), {"status": "removed", "name": "canvas"})
         self.assertEqual(self.store.service_list(), [])
@@ -77,16 +79,16 @@ class OAuthAdminTest(unittest.TestCase):
             self.store.service_remove("canvas")
 
     def test_guarded_service_removal_preserves_reconfigured_and_recreated_service(self):
-        self.store.service_add("devbox", "http://127.0.0.1:18520/mcp", ["alpha"])
+        self.store.service_add("devbox", "http://127.0.0.1:18520/mcp", {'alpha': 'writer'}, roles=["reader", "writer"], default_role="reader")
         expected = self.store.service_list()[0]
         with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("UPDATE services SET ponds=? WHERE name='devbox'", (json.dumps(["beta"]),))
+            db.execute("UPDATE services SET callers=? WHERE name='devbox'", (json.dumps({"beta": "writer"}),))
         before = self.path.read_bytes()
         with self.assertRaisesRegex(ValueError, "definition changed"):
             self.store.service_remove("devbox", expected)
         self.assertEqual(self.path.read_bytes(), before)
         self.store.service_remove("devbox")
-        self.store.service_add("devbox", "http://127.0.0.1:18520/mcp", ["alpha"])
+        self.store.service_add("devbox", "http://127.0.0.1:18520/mcp", {'alpha': 'writer'}, roles=["reader", "writer"], default_role="reader")
         with self.assertRaisesRegex(ValueError, "definition changed"):
             self.store.service_remove("devbox", expected)
         current = self.store.service_list()[0]
@@ -95,25 +97,54 @@ class OAuthAdminTest(unittest.TestCase):
 
     def test_service_cli_checks_ponds_and_prints_the_secret_once(self):
         from boring_crocodile import admin
-        settings = type("S", (), {"ponds": {"alpha": object(), "beta": object()}, "pirate_service_callers": {"parrot": 993}})()
+        from types import SimpleNamespace
+        from boring_crocodile.site_ports import DEFAULT_PROTECTED_PORTS
+
+        settings = SimpleNamespace(ponds={"alpha": object(), "beta": object()},
+                                   pirate_service_callers={"parrot": 993},
+                                   protected_ports=DEFAULT_PROTECTED_PORTS, bind_port=8503)
+        from boring_crocodile.site_render import ServicePortReport
+
         errors = []
-        def run(*argv):
+        def run(*argv, confirmation=None, rendered=DEFAULT_PROTECTED_PORTS):
+            if argv[0] == "service-add":
+                argv += ("--roles", "reader,writer", "--default-role", "reader")
             out = io.StringIO()
+            input_stream = io.StringIO(confirmation or "")
+            input_stream.isatty = lambda: confirmation is not None
             errors.append(io.StringIO())
             with patch.object(sys, "argv", ["boring-crocodile-admin", *argv]), \
                     patch.object(admin.os, "geteuid", return_value=0), \
                     patch.object(admin.Settings, "load", return_value=settings), \
                     patch.object(admin, "oauth_store", return_value=self.store), \
+                    patch.object(admin, "_rendered_service_ports", return_value=ServicePortReport(rendered)), \
+                    patch.object(admin, "site_lock", side_effect=lambda path: site_lock(self.root, owner=os.getuid())), \
+                    patch.object(sys, "stdin", input_stream), \
                     redirect_stdout(out), redirect_stderr(errors[-1]):
                 try:
                     admin.main()
                 except SystemExit as exit:
                     return exit.code, out.getvalue()
             return 0, out.getvalue()
-        code, _ = run("service-add", "canvas", "--url", "http://127.0.0.1:18511/mcp", "--ponds", "alpha,gamma")
+        code, _ = run("service-add", "canvas", "--url", "http://[::1]:19012/mcp", "--callers", "alpha=writer")
+        self.assertNotEqual(code, 0)
+        self.assertIn("canvas: unprotected loopback service port 19012", errors[-1].getvalue())
+        code, _ = run("service-add", "canvas", "--url", "http://127.0.0.1:18511/mcp",
+                      "--callers", "alpha=writer", rendered=())
+        self.assertNotEqual(code, 0)
+        self.assertIn("loopback port 18511 has no confirmed rendered bind protection", errors[-1].getvalue())
+        code, _ = run("service-add", "canvas", "--url", "http://127.0.0.1:18511/mcp", "--callers", "alpha=writer,gamma=writer")
         self.assertEqual(code, 2)
         self.assertEqual(self.store.service_list(), [])
-        code, out = run("service-add", "canvas", "--url", "http://127.0.0.1:18511/mcp", "--ponds", "alpha,beta")
+        code, out = run("service-add", "canvas", "--url", "http://127.0.0.1:18511/mcp", "--callers", "alpha=writer,beta=writer")
+        self.assertEqual(code, 0)
+        self.assertNotIn("client_secret", json.loads(out))
+        self.assertEqual(self.store.service_list(), [])
+        self.assertEqual(run("service-add", "canvas", "--url", "http://127.0.0.1:18511/mcp",
+                             "--callers", "alpha=writer,beta=writer", "--apply")[0], 2)
+        self.assertEqual(self.store.service_list(), [])
+        code, out = run("service-add", "canvas", "--url", "http://127.0.0.1:18511/mcp",
+                        "--callers", "alpha=writer,beta=writer", "--apply", confirmation="APPLY\n")
         self.assertEqual(code, 0)
         # stdout is the JSON answer alone (pipeable); the human reminder goes to stderr.
         self.assertIn("client_secret", json.loads(out))
@@ -127,14 +158,54 @@ class OAuthAdminTest(unittest.TestCase):
         self.assertEqual(code, 0)
         endpoint_plan = json.loads(out)
         code, out = run("service-endpoint", "canvas", "--url", endpoint_plan['after'],
-                        "--apply", "--approve-digest", endpoint_plan['plan_digest'])
+                        "--apply", confirmation="APPLY\n")
         self.assertEqual(code, 0)
         self.assertTrue(json.loads(out)['applied'])
         current = self.store.service_list()[0]
+        before = self.path.read_bytes()
+        with site_lock(self.root, owner=os.getuid()):
+            for command in (
+                    ("service-add", "new", "--url", "https://new.test/mcp", "--callers", "alpha=writer"),
+                    ("service-grants", "canvas", "--callers", "alpha=writer"),
+                    ("service-endpoint", "canvas", "--url", "https://changed.test/mcp"),
+                    ("service-remove", "canvas")):
+                self.assertEqual(run(*command, "--apply", confirmation="APPLY\n")[0], 2)
+                self.assertEqual(self.path.read_bytes(), before)
         self.assertEqual(run("service-remove", "canvas", "--expected-definition", "{}")[0], 2)
         self.assertEqual(len(self.store.service_list()), 1)
         self.assertEqual(run("service-remove", "canvas", "--expected-definition", json.dumps(current))[0], 0)
+        self.assertEqual(len(self.store.service_list()), 1)
+        self.assertEqual(run("service-remove", "canvas", "--apply")[0], 2)
+        self.assertEqual(run("service-remove", "canvas", "--expected-definition", json.dumps(current),
+                             "--apply", confirmation="APPLY\n")[0], 0)
         self.assertEqual(run("service-remove", "canvas")[0], 2)
+
+    def test_service_plans_are_readonly_and_bind_the_credential_identity(self):
+        before = self.path.read_bytes()
+        with patch("boring_crocodile.oauth_records.secrets.token_urlsafe",
+                   side_effect=AssertionError("planning generated a credential")):
+            plan = self.store.plan_service_add("canvas", "https://canvas.test/mcp", {'alpha': 'writer'}, roles=["reader", "writer"], default_role="reader")
+        self.assertEqual(self.path.read_bytes(), before)
+        with self.assertRaisesRegex(ValueError, "stale"):
+            self.store.service_add("canvas", "https://changed.test/mcp", {'alpha': 'writer'},
+                                   digest=plan["plan_digest"], roles=["reader", "writer"], default_role="reader")
+        self.assertEqual(self.store.service_list(), [])
+        added = self.store.service_add("canvas", "https://canvas.test/mcp", {'alpha': 'writer'},
+                                       digest=plan["plan_digest"], roles=["reader", "writer"], default_role="reader")
+        before = self.path.read_bytes()
+        removal = self.store.plan_service_remove("canvas", self.store.service_list()[0])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertNotIn(added["client_secret"], json.dumps(removal))
+        self.assertNotIn("secret_sha256", removal)
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("UPDATE services SET secret_sha256=? WHERE name='canvas'",
+                       (secret_key("synthetic replacement"),))
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "stale"):
+            self.store.service_remove("canvas", digest=removal["plan_digest"])
+        self.assertEqual(self.path.read_bytes(), before)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
 
     def test_scoped_revoke_and_stale_refresh(self):
         plan = self.store.plan_revoke("alpha", "client1")
@@ -233,8 +304,8 @@ class OAuthAdminTest(unittest.TestCase):
 
 
     def test_endpoint_change_preserves_identity_grants_and_records(self):
-        created = self.store.service_add('canvas', 'http://127.0.0.1:18511/mcp', ['alpha'])
-        self.store.service_add('knowledge', 'https://kb.test/mcp', ['beta'])
+        created = self.store.service_add('canvas', 'http://127.0.0.1:18511/mcp', {'alpha': 'writer'}, roles=["reader", "writer"], default_role="reader")
+        self.store.service_add('knowledge', 'https://kb.test/mcp', {'beta': 'writer'}, roles=["reader", "writer"], default_role="reader")
         with closing(sqlite3.connect(self.path)) as db, db:
             before = service(db, name='canvas')
             self.put(db, 'service', 'old-service-token', {'subject':'alpha',
@@ -248,7 +319,7 @@ class OAuthAdminTest(unittest.TestCase):
             after = service(db, name='canvas')
             self.assertEqual(service(db, name='knowledge')['url'], 'https://kb.test/mcp')
             self.assertEqual(db.execute('SELECT count(*) FROM records').fetchone()[0], 11)
-        for key in ('client_id', 'secret_sha256', 'ponds', 'ping_timeout'):
+        for key in ('client_id', 'secret_sha256', 'callers', 'roles', 'default_role', 'ping_timeout'):
             self.assertEqual(before[key], after[key])
         self.assertEqual(after['url'], plan['after'])
         self.assertNotIn(created['client_secret'], json.dumps(changed))
@@ -260,9 +331,9 @@ class OAuthAdminTest(unittest.TestCase):
         self.assertEqual(self.store.service_list()[0]['url'], before['url'])
 
     def test_endpoint_plan_rejects_changed_callers_and_invalid_url(self):
-        self.store.service_add('canvas', 'https://old.test/mcp', ['alpha'])
+        self.store.service_add('canvas', 'https://old.test/mcp', {'alpha': 'writer'}, roles=["reader", "writer"], default_role="reader")
         plan = self.store.service_endpoint('canvas', 'https://new.test/mcp')
-        grants = self.store.service_grants('canvas', ['alpha', 'pirate/parrot'])
+        grants = self.store.service_grants('canvas', {"alpha":"writer","pirate/parrot":"writer"})
         self.store.service_grants('canvas', grants['after'], grants['plan_digest'])
         with self.assertRaisesRegex(ValueError, 'stale'):
             self.store.service_endpoint('canvas', plan['after'], plan['plan_digest'])
@@ -272,20 +343,20 @@ class OAuthAdminTest(unittest.TestCase):
             self.store.service_endpoint('missing', 'https://new.test/mcp')
 
     def test_grant_plan_preserves_credentials_and_rejects_stale_plan(self):
-        created = self.store.service_add('canvas', 'https://canvas.test/mcp', ['alpha'])
+        created = self.store.service_add('canvas', 'https://canvas.test/mcp', {'alpha': 'writer'}, roles=["reader", "writer"], default_role="reader")
         with closing(sqlite3.connect(self.path)) as db, db:
             before = service(db, name='canvas')
-        plan = self.store.service_grants('canvas', ['alpha', 'pirate/parrot'])
+        plan = self.store.service_grants('canvas', {"alpha":"writer","pirate/parrot":"writer"})
         self.assertFalse(plan['applied'])
-        self.assertEqual(self.store.service_list()[0]['ponds'], ['alpha'])
-        changed = self.store.service_grants('canvas', ['alpha', 'pirate/parrot'], plan['plan_digest'])
+        self.assertEqual(self.store.service_list()[0]['callers'], {'alpha': 'writer'})
+        changed = self.store.service_grants('canvas', {"alpha":"writer","pirate/parrot":"writer"}, plan['plan_digest'])
         self.assertTrue(changed['applied'])
         with closing(sqlite3.connect(self.path)) as db, db:
             after = service(db, name='canvas')
         for key in ('client_id','secret_sha256','url','ping_timeout'):
             self.assertEqual(before[key], after[key])
         with self.assertRaisesRegex(ValueError, 'stale'):
-            self.store.service_grants('canvas', ['alpha', 'pirate/parrot'], plan['plan_digest'])
+            self.store.service_grants('canvas', {"alpha":"writer","pirate/parrot":"writer"}, plan['plan_digest'])
         self.assertNotIn('secret', json.dumps(changed))
 
     def table(self, name):

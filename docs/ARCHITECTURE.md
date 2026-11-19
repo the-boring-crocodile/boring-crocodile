@@ -47,8 +47,6 @@ controller, endpoint and OAuth store serve all of them.
   from its token; no tool takes a Pond or environment argument (one is
   refused before any worker is contacted). Removing a Pond invalidates its
   tokens at the next controller start.
-- **ChatGPT's multiple accounts:** `pond_profile` carries
-  `_meta["openai/profile"]: true`, so ChatGPT can label connections.
 - **Possession of a Pond's approval secret authorizes that Pond.** It is an
   owner-operated model, not a multi-user identity provider. Display names show
   on the approval page.
@@ -105,21 +103,34 @@ are outside the command slice.
 | What | Where | Owner |
 |---|---|---|
 | OAuth clients, approvals, codes, tokens (SHA-256 only), registered services | `/var/lib/boring-crocodile/oauth.sqlite3` | controller ([OAUTH](OAUTH.md)) |
-| Job records, Pirate jobs included | `POND-HOME/.boring-crocodile/jobs.sqlite3` | worker ([TOOLS](TOOLS.md#jobs-and-time-limits)) |
+| Job records, Pirate jobs included | `DEFAULT-CWD/.boring-crocodile/jobs.sqlite3` | worker ([TOOLS](TOOLS.md#jobs-and-time-limits)) |
 | Pirate and service registries | memory, refreshed by registration and heartbeat | worker |
 | Context | the Pond's handbook | the Pond |
 
 After a worker restart, unfinished jobs become `interrupted`: a record is
-evidence, not a supervisor.
+evidence, not a supervisor. Receipt initialization failures disable only
+managed jobs; the worker reports the cause and keeps other tools available.
+The site deploy never opens a Pond-owned receipt database.
 
 ## Outcomes
 
-Normal outcomes are data. An owner that decides one (not found, busy, stale,
-forbidden, limit, ...) raises one `Refusal(code, message, **details)`,
-caught once at the worker boundary. A worker reply is exactly one of
-`result`, `refusal` or `failure`; agents get a refusal as `{code, message,
-...}` and a failure as `{failure}`, both as tool errors. Codes from a Pirate
-or service pass through unchanged. Nothing is silently repaired or retried.
+Common's dependency-free boring-outcomes owns Refused and Failed and their
+one flat rendering: `{status, code, message, ...details}`. Refused means nothing
+started or changed; Failed means work started and may have had effects. Codes
+name causes independently of status. Detail values must be JSON at construction.
+
+The worker returns exactly one result, refusal or failure. The controller
+carries typed outcomes through the SDK as compact JSON text and identical
+structuredContent. Batch and job records embed refusal/failure objects;
+their lifecycle states remain separate. Results in the supported receipt
+schema are read unchanged. Older receipt schemas are refused by the worker;
+there is no receipt migration.
+
+Failures preserve typed downstream causes. Known cleanup and deadline
+exceptions are classified at their existing catch boundaries; generic worker
+exceptions use worker_failed. No code is inferred from error text. Worker
+unreachable before sending and a job_wait response deadline are refusals,
+because neither changed anything. Nothing is silently repaired or retried.
 
 ## Trust
 
@@ -148,11 +159,13 @@ joins every Pond's group.
 
 ## Configuration rules
 
-`config.toml` is trusted, root-owned input (`site/default/` shows a generated
-one). It refuses: no Pond, unknown environments, duplicate profile IDs,
-shared sockets, overlapping context roots, task sockets, unit prefixes or
-slices used twice, and the removed single-Pond keys (top-level `[context]`,
-`[execution]`, `[auth] approval_secret_file`), naming the key to delete.
+`config.toml` and the per-Pond files are trusted, root-owned input
+(`site/default/` shows a generated description). Parsing validates the site state,
+identity bindings, explicit ceilings and unique profile IDs, sockets and context
+roots. Unit names, task slices and sockets follow the Pond identity. Task policy
+is rendered into the base task unit from `[execution].no_new_privileges`; status
+inspects the effective systemd properties. The one-time importer owns legacy
+conversion.
 Config checks do not prove OS isolation; distinct accounts and permissions do.
 
 ## Not goals

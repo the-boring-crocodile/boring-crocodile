@@ -1,100 +1,62 @@
-# Installing the Crocodile
+# Crocodile setup reference
 
-A new site in four steps: deploy the runtime, create the first Pond, activate
-the site, connect a client. Later you can add Ponds, Pirates and services to
-the running site. Separating the runtime from the accounts and site settings
-lets you update the code later without replacing a Pond's home or handbook.
+For a first installation, follow the family's
+[Getting started](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/getting-started.md).
+That page owns download, provisioning, activation, proxy setup and the first
+client call. This reference describes the commands, inputs and files.
 
-Setup commands show a plan before applying it. `deploy` has a separate
-read-only `--check`; running it without that flag performs the deployment.
+For later work, use the [task map](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/installation.md).
+An existing legacy description requires the
+[adoption procedure](OPERATIONS.md#adopting-a-pre-description-site), before
+normal deployment.
 
-## Our example
+## Host and runtime
 
-This page follows the Pond family's [example site](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/example-site.md):
-the Crocodile at `crocodile-url.example.test`, listening on `127.0.0.1:8503`
-and running as `crocodile-mcp`; the first Pond `pond` with the account
-`crocodile-user`; later the Pond `garden`, the Pirate `parrot` and the
-service `canvas`. Put your own values where these appear.
+Linux releases target x86_64, glibc 2.39 or newer, systemd and cgroup v2.
+Python 3.12 or newer runs deploy; the runtime brings its own Python.
+The home parent and installed runtime must be root-owned and protected
+from unprivileged writes. No ACL executable is required.
 
-## Before you start
+Memory defaults to a quarter of host RAM, bounded to 512 MiB–8 GiB for
+each Pond. The worker and its commands share that ceiling. It reserves no
+memory. Docker is needed for the Linux service deploys, not this runtime.
 
-- An **x86_64 Linux** host with systemd and cgroup v2, and `python3` 3.11 or newer (only to
-  run the deploy, which refuses an older one; the runtime brings its own Python).
-- sudo, and a root-owned parent directory for the Pond homes (here `/home`).
-- `https://crocodile-url.example.test` served by your reverse proxy, which
-  forwards the Crocodile's paths to `127.0.0.1:8503` (the list: [The reverse
-  proxy](#the-reverse-proxy) below). DNS, TLS, the proxy
-  and the firewall are yours; setup does not touch them.
-- `curl`, and the release from the [releases page](https://github.com/the-boring-crocodile/boring-crocodile/releases):
-  the archive `boring-crocodile-V-linux-x86_64.tar.gz` and its `.sha256` file
-  (tag `vV`); step 1 downloads both. The checksum detects a
-  damaged download; a checksum from the same page does not authenticate its
-  origin. Versions tested together:
-  [releases and versions](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/updating.md#releases-and-versions).
+<a id="1-deploy-the-runtime"></a>
+The runtime lives at `/opt/boring-crocodile/current`; its setup and admin
+commands are in `bin/`. A release's deploy installs runtime code without
+creating a site. `deploy --check` is read-only. Without that flag it
+prepares, checks, switches and starts according to the installed state.
+[Operations](OPERATIONS.md#updating) owns update behavior and recovery.
 
-The memory ceiling proposed at activation is a quarter of host RAM, clamped
-to 512 MiB–8 GiB per Pond. It reserves no RAM and is not a total-host sizing
-recommendation. Leave room for simultaneous workers, retained releases and
-their state; services and model inference add their own requirements.
-[Linux prerequisites and costs](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/installation.md#what-you-need)
-covers the whole site. Docker is needed by the service deploys, not by this
-systemd runtime.
+## Setup commands
 
-## 1. Deploy the runtime
+All planned mutations preview without `--apply`. With it, they recompute
+the plan and require typed APPLY at a terminal. Plan digests are internal
+stale-state guards, not approval tokens.
 
-One block, from the download to the deploy; set `V` to the release you
-install (the newest is on the releases page) and run it in one shell:
+| Input or operation | Meaning |
+|---|---|
+| `--wizard` | Ask for a Pond's accounts, home, display name and handbook |
+| `--config FILE` | Read those provisioning answers from JSON |
+| `--add-pond NAME` | Provision an additional, parked Pond; reuse the controller |
+| `--save-inputs FILE` | Save wizard answers, without credentials |
+| `--site-wizard` | Ask for public origin, listener and memory policy |
+| `--site-config FILE` | Read site policy from JSON |
+| `--site-extend` | Enable parked declarations and render |
+| `--grant-services all\|a,b` | Grant selected registered services to added Ponds |
+| `--site-render` | Reconcile the saved description and generated integration |
+| `--apply` | Review and confirm the fresh plan, then perform it |
 
-    V=0.4.21
-    f=boring-crocodile-$V-linux-x86_64.tar.gz
-    u=https://github.com/the-boring-crocodile/boring-crocodile/releases/download/v$V
-    mkdir -p ~/Downloads && cd ~/Downloads
-    curl -fLO "$u/$f" && curl -fLO "$u/$f.sha256" &&
-    sha256sum -c "$f.sha256" &&            # must print OK; if not, the block stops here
-    sudo mkdir -p /root/releases &&
-    sudo tar xzf "$f" -C /root/releases &&
-    sudo install -d -m 0755 /opt/boring-crocodile &&   # the deploy refuses an install folder that does not exist
-    sudo /root/releases/boring-crocodile-$V/deploy
+<a id="2-create-the-first-pond"></a>
+## Provisioning inputs
 
-The deploy installs the runtime under `/opt/boring-crocodile/current` and
-nothing else: no accounts, no credentials, no running service. How deploy,
-update and rollback work is the same for every Pond component:
-[boring-deploy](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/packages/boring-deploy/README.md).
-The Crocodile's specifics are in [OPERATIONS](OPERATIONS.md).
+Setup JSON and imported handbook sources must be root-owned, protected from
+other writers and free of symlinks throughout their paths. Stage these inputs
+under a protected root-owned directory before running setup. Preview shows
+their paths, owners and modes. Apply reads the admitted handbook bytes before
+provisioning changes the host. Packaged handbooks need no input staging.
 
-The commands below live in `/opt/boring-crocodile/current/bin`. Put them on
-root's PATH:
-
-    sudo ln -sfn /opt/boring-crocodile/current/bin/boring-crocodile-{setup,admin} /usr/local/bin/
-
-## 2. Create the first Pond
-
-    sudo boring-crocodile-setup --wizard --apply
-
-The wizard asks for the accounts, the home, the name people see and the
-starting context, and checks each answer as you give it; we answer
-`crocodile-user`, `crocodile-mcp`, `/home/crocodile-user`, the default name
-and the packaged starter. It shows the plan in a few plain lines, applies it
-when you type `APPLY`, and names the next step. It creates:
-
-- the accounts `crocodile-user` (the Pond) and `crocodile-mcp` (the
-  Crocodile), each with a same-named group, password disabled, shell
-  `nologin`; `crocodile-mcp` joins the group `crocodile-user`;
-- `/home/crocodile-user` with `handbook/`, `work/` and `lab/`;
-- the starting context in `handbook/`: the packaged starter handbook
-  (`HANDBOOK.md`, `WELCOME.md`), a proposal to edit together; or your own
-  files instead (`context_mode: import`, at most 64 files of 1 MiB each), for
-  example one of boring-pond's sample handbooks;
-- the receipt `/etc/boring-crocodile/initial-setup.json` with the Pond's
-  permanent `profile_id`.
-
-No service starts and no credential is created yet.
-
-Unattended, the same answers come from a file. Review the plan, then apply
-exactly that plan by its digest:
-
-    sudo boring-crocodile-setup --config setup-inputs.json
-    sudo boring-crocodile-setup --config setup-inputs.json --apply --approve-digest DIGEST
+A JSON input has these required fields:
 
 ```json
 {
@@ -107,28 +69,24 @@ exactly that plan by its digest:
 }
 ```
 
-(`--wizard --save-inputs setup-inputs.json` writes this file from your answers.)
-An optional `"display_name"` (up to 64 characters, for example `"The Steady
-Beaver"`) is the name people see on the sign-in page and in `pond_ping` and
-`pond_profile`; without it the first Pond is "The Pond" and an added one its
-name. The same key works in an `--add-pond` file. The file
-holds names and paths, never credentials. Existing accounts or paths are not
-adopted: they make the plan ask for review.
+An optional `display_name` is the sign-in name, up to 64 characters.
+Packaged context choices are `starter`, `engineer` and `consultant`.
+Each seeds HANDBOOK.md, WELCOME.md and the shared OPERATING_TOGETHER.md.
+Import mode instead uses the selected `context_source` and `context_files`;
+it accepts at most 64 files of 1 MiB each.
 
-## 3. Activate the site
+Provisioning publishes numeric identity bindings and a permanent profile UUID
+before creating accounts. It creates missing secrets and seeds missing files;
+it retains existing secret and file bytes on a rerun. It starts no worker.
+Unexpected existing accounts or paths require review.
 
-Pirates need a local registration socket so they can announce their flavours
-to a Pond. Enable that reception only for Ponds that will use them
-(`service_registration_enabled`); it does not itself admit a Pirate. The site
-wizard leaves it off. You can enable it later with
-[`--site-render --guests POND`](OPERATIONS.md#updating).
+The initial Pond is named `pond`. Additional names are 1–24 lowercase
+letters, digits and inner hyphens. Each Pond has a dedicated account,
+same-named private group, home and declaration.
 
-Our site will have the Pirate `parrot`, so it activates from a file, after
-creating the group the Pirates join:
+## Site-policy inputs
 
-    sudo groupadd --system pond-pirates
-    sudo boring-crocodile-setup --site-config site-inputs.json
-    sudo boring-crocodile-setup --site-config site-inputs.json --apply --approve-digest DIGEST
+These fields are required in `--site-config` JSON:
 
 ```json
 {
@@ -139,206 +97,107 @@ creating the group the Pirates join:
   "memory_bytes": 2147483648,
   "swap_bytes": 0,
   "tasks_max": 256,
-  "task_tasks_max": 128,
-  "service_registration_enabled": true
+  "task_tasks_max": 128
 }
 ```
 
-A site without Pirates can use the wizard instead. It asks for the public
-URL, the local address and port, and the memory ceiling per Pond (it proposes
-a quarter of the host's memory, between 512M and 8G); swap and process limits
-keep the defaults above. At the end it says where the approval secret is:
+Optional fields are `no_new_privileges` (default true) and
+`protected_ports` (additional TCP ports). The public URL is an HTTPS
+origin. Bind host is an IP literal; port is 1024–65535. The per-task process
+limit may not exceed the shared process limit.
 
-    sudo boring-crocodile-setup --site-wizard --apply
+Activation enables the initial Pond and declares the site running.
+The common renderer writes units, slices and tmpfiles rules, starts the
+desired components and checks local readiness. It creates no account or
+secret. Every enabled Pond has reception; admission is separate.
 
-Either way, activation writes `/etc/boring-crocodile/config.toml` (each Pond
-with its home as the file root its file tools may read and write), the systemd
-units, slice and tmpfiles rules, and the Pond's approval credential
-`/etc/boring-crocodile/credentials/approval-secret` (mode 0600). It starts the
-site and watches local health for up to a minute; a site that stays
-unhealthy is reported as `configured_but_degraded`.
+## Description and files
 
-### The reverse proxy
+| Path | Owner of the contents |
+|---|---|
+| `/etc/boring-crocodile/config.toml` | Site state, controller binding, listener, OAuth-store path |
+| `/etc/boring-crocodile/ponds/NAME/config.toml` | Pond identity, context, limits, execution and credential path |
+| `/etc/boring-crocodile/credentials/` | Root-only approval secrets |
+| `/var/lib/boring-crocodile/oauth.sqlite3` | Sign-ins, service credentials and grants |
+| `HOME/handbook/`, `work/`, `lab/` | The Pond's editable files |
+| `/etc/systemd/system/boring-crocodile-*` | Generated host integration |
 
-The Crocodile answers on loopback; your proxy forwards these paths of
-`https://crocodile-url.example.test` to `127.0.0.1:8503`, unchanged:
+The main description contains no secrets. Permission details live in
+[PERMISSIONS](PERMISSIONS.md); schema and derived defaults live in
+[OPERATIONS](OPERATIONS.md#the-description-and-the-render).
 
-- `/mcp/*` (each Pond's MCP endpoint, `/mcp/POND`)
-- `/.well-known/oauth-protected-resource/mcp/*` and
-  `/.well-known/oauth-authorization-server`
-- `/authorize`, `/token`, `/revoke`, `/register`, `/approve` (sign-in)
-- `/introspect` and `/services/register` (services check tokens and register
-  here)
+## Controller listener and protected ports
 
-`/services/register` is the Crocodile's even though services may live under
-`/services/NAME/...`: give it its own rule, before any `/services/*` rule. In
-Caddy, for our example:
+A root-owned systemd socket holds the controller listener. Restarting the
+controller keeps that socket open; a full site stop closes it.
+Pond and Pirate command slices deny TCP binds to the controller port and ports
+18510–18539 on IPv4 and IPv6. Service registrations with loopback URLs must
+use a protected port. Add custom loopback ports to `server.protected_ports`
+and render before using them. Up to 127 additional ports are supported.
 
-    crocodile-url.example.test {
-        @crocodile path /mcp/* /.well-known/oauth-protected-resource/mcp/* /.well-known/oauth-authorization-server /authorize /token /revoke /register /approve /introspect /services/register
-        handle @crocodile {
-            reverse_proxy 127.0.0.1:8503
-        }
-    }
+These rules need cgroup/BPF socket-bind support and govern the Pond and Pirate command slices,
+not unrelated accounts. Verify the host enforces them before admitting
+untrusted work. An account with root authority can change that policy.
 
-A service on the same domain adds its own routes (boring-services README).
+## The reverse proxy
 
-## 4. Check and connect
+Forward these paths unchanged to the configured listener:
 
-    sudo boring-crocodile-admin status --check
-    sudo boring-crocodile-admin list
+- `/mcp/*`, `/.well-known/oauth-protected-resource/mcp/*`
+- `/.well-known/oauth-authorization-server`
+- `/authorize`, `/token`, `/revoke`, `/register`, `/approve`
+- `/introspect`, `/services/register`
 
-`status --check` exits nonzero on degraded local state. It cannot see your TLS,
-your proxy or a client; only the client journey proves those:
-
-1. In your MCP client, add the Pond's URL, `https://DOMAIN/mcp/POND`. In our
-   example: `https://crocodile-url.example.test/mcp/pond`. Clients presenting a
-   supported metadata document can start with that URL alone. For a registered
-   client, create its ID with `sudo boring-crocodile-admin oauth client-add
-   --name ... --redirect-uri ...` and configure it in the client; open dynamic
-   registration is off ([OAUTH](OAUTH.md)). See the family's
-   [client guide](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/clients.md)
-   for VS Code and version-specific Visual Studio notes.
-2. The sign-in page asks for the Pond's approval secret. Read it in a private
-   administrator terminal: `sudo cat /etc/boring-crocodile/credentials/approval-secret`.
-   Never put it in a URL, a chat, a command history or a log.
-3. Ask the client to call the Pond's tools `pond_bootstrap` and then `exec`
-   with the command `pwd`: the answer is `/home/crocodile-user`, the Pond's
-   home, run as `crocodile-user`.
-
-Each connection belongs to one Pond for good; there is no switching Ponds
-inside a conversation. Use one conversation per Pond.
+Keep `/services/register` on the Crocodile when services add routes.
+The [install walkthrough](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/getting-started.md#4-connect-the-reverse-proxy)
+has the Caddy example. DNS, TLS and firewall policy remain operator-owned.
 
 ## Adding to a running site
 
-Each addition reads the site as it is, runs `site-check` first and stops on
-anything irregular. Without `--apply` it shows its plan, with a diff per
-changed file; `--apply` asks for `APPLY` (unattended: `--apply
---approve-digest DIGEST`), backs up what it replaces under
-`/var/lib/boring-crocodile-site/site-backups/`, restarts what needs it and runs
-`site-check` again.
+[Add a Pond](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/add-pond.md)
+owns provisioning and extension. Service policy is stored separately in
+SQLite: service mutations do not render or restart the Crocodile.
 
-### Another Pond: `garden`
+<a id="a-pirate-parrot"></a>
+### Pirate admission
 
-Create the account and home first, then review how they will join the running
-site. This lets you inspect the new Pond's service grants and resource limits
-before it can accept a client connection:
+The Pirate installer handles first admission. Manual `pirate-add NAME
+--account ACCOUNT --ponds all|a,b` previews admission, client membership and
+the render tail; `--apply` confirms it. `all` selects currently enabled
+Ponds. For an existing Pirate, `pirate-add NAME --ponds a,b --apply` adds
+Ponds to its recorded list without repeating the account or editing Pirate
+configuration. The description's `[pirate_services.callers.NAME]` owns the
+`uid` and admitted `ponds`; the response supplies `service_authority` directly.
+The running Pirate discovers the new sockets and verifies admission.
+`pirate-remove NAME --ponds a,b` previews withdrawal of those active or parked
+Ponds; `--apply` confirms the same render. Other pairs stay recorded, and
+removing the last Pond leaves the Pirate admitted for none. Without `--ponds`,
+`pirate-remove NAME` removes the whole admission; `--retire` is only for whole
+removal. A withdrawn Pond loses access even while its old socket remains.
+Another account under an existing Pirate name is refused. Registration names
+the Pirate from this record, rather than from the account's login name. Admission restarts
+the controller and every enabled Pond worker. It grants no service access:
+[Let a Pirate call a service](SERVICES_AND_PIRATES.md#let-a-pirate-call-a-service)
+owns the three grants and the restarts needed for them.
+[Services and Pirates](SERVICES_AND_PIRATES.md) owns these policies;
+[Pirates](https://github.com/the-boring-crocodile/boring-pirates/blob/main/README.md#installing-a-pirate)
+owns installation.
 
-    sudo boring-crocodile-setup --add-pond garden --wizard --apply
-    sudo boring-crocodile-setup --site-extend --grant-services all
+## Interrupted changes
 
-The second command only previews the extension. If the grants and limits fit,
-apply its top-level `plan_digest`:
+For provisioning, rerun the same inputs after inspecting the failure.
+For a saved desired description, the common render repairs integration even
+when file contents already match. Explicit retirement is separate from
+render. [Operations](OPERATIONS.md#when-a-change-stops-part-way) gives the
+recovery path.
 
-    sudo boring-crocodile-setup --site-extend --grant-services all --apply --approve-digest DIGEST
-
-`all` grants every currently registered service. Use comma-separated service
-names instead when the new Pond needs fewer; keep the same selection in the
-preview and apply commands.
-
-Unattended, `--add-pond garden --config garden.json` takes the same answers as
-step 2's file, with the Crocodile's existing account as `control_user`:
-
-```json
-{
-  "execution_user": "garden-user",
-  "control_user": "crocodile-mcp",
-  "home": "/home/garden-user",
-  "context_mode": "starter",
-  "context_source": null,
-  "context_files": []
-}
-```
-
-Each plan prints its `plan_digest` at the top level: that is the one to pass
-to `--apply --approve-digest` (a plan with service grants also shows the
-grants' own digest inside; it is not the one to approve).
-
-`--add-pond` creates the Pond's own account, group and home as in step 2; we
-answer `garden-user` and `/home/garden-user`. A Pond's name is 1 to 24
-lowercase letters, digits and inner hyphens; it becomes the path in its URL.
-`--site-extend` brings it into the running site: its worker, task socket,
-slice and tmpfiles file are new, the Crocodile gains its group and its
-credential `/etc/boring-crocodile/credentials/garden-approval-secret`, and its
-section is appended to `config.toml` (existing lines stay as they are). It
-gets setup's default ceilings (memory a quarter of RAM, 512 MiB to 8 GiB;
-swap 0; 256 tasks), not the values the site was activated with, unless
-`--memory 2G`, `--swap 512M` or `--tasks 256` say otherwise. `--grant-services` takes `all` or names; without it the Pond
-gets no service.
-
-Its URL: `https://crocodile-url.example.test/mcp/garden`.
-
-The site's Pirates are not offered `garden` by this: when it accepts guests,
-the plan and the answer name each Pirate and the `pirate-add` command that
-offers it `garden` ([A Pirate](#a-pirate-parrot)).
-
-A Pond added before activation is simply activated with the others in step 3.
-Taking a Pond out and bringing it back: [OPERATIONS](OPERATIONS.md).
-
-### A Pirate: `parrot`
-
-The Pirate's own installer (boring-pirates) does this; by hand it is a plan,
-then the apply:
-
-    sudo boring-crocodile-admin pirate-add parrot --account pirate-parrot --ponds all
-    sudo boring-crocodile-admin pirate-add parrot --account pirate-parrot --ponds all --apply
-
-`--ponds all` means the Ponds that accept guests at that moment.
-
-It lets `pirate-parrot` register with the Ponds that accept guests (group
-`pond-pirates`), lets those Ponds' workers call it (group `pirate-clients`,
-the workers restart), and lists it as a caller of the services it is granted.
-Its answer names what the Pirate's own configuration needs. `pirate-remove
-parrot` takes it back. See [SERVICES_AND_PIRATES](SERVICES_AND_PIRATES.md).
-
-A Pond added later (`garden`) is offered to the existing Pirate by the same
-command again, with the same account:
-
-    sudo boring-crocodile-admin pirate-add parrot --account pirate-parrot --ponds all
-    sudo boring-crocodile-admin pirate-add parrot --account pirate-parrot --ponds all --apply
-
-It plans only what is missing, as the host shows it: `garden`'s worker joins
-`pirate-clients` and restarts; `config.toml` and the controller stay as they
-are. With nothing missing it answers `already serves: pond, garden` and
-changes nothing. Then the Pirate's side, which the answer names
-(`pirate_side`): `client_uids` in `/etc/boring-pirates/parrot/config.json` must
-include the uids it lists (add `garden-user`'s), and the Pirate restarts,
-after which it registers with `garden` too:
-
-    sudo systemctl restart boring-pirate@parrot.service
-
-Another account under the name `parrot` is refused. `pirate-add` never takes
-a Pond away; `pirate-remove` takes out the whole Pirate.
-
-### A service: `canvas`
-
-The site learns about a service with `boring-crocodile-admin service-add`,
-which prints the credentials the service's configuration needs; then the
-service's own deploy installs it. The order and the commands:
-[boring-services](https://github.com/the-boring-crocodile/boring-services/blob/main/README.md#installing-on-linux); what
-`service-add` checks and grants: [SERVICES_AND_PIRATES](SERVICES_AND_PIRATES.md).
-
-## If a step is interrupted
-
-Setup keeps root-private receipts (`/etc/boring-crocodile/initial-setup.json`,
-`site-activation.json`, `ponds/garden/`) and never deletes users, documents or
-partial state on failure. Run the same command with the same inputs, the same
-digest and `--resume`: recorded steps are checked again, and anything it did
-not record (an account a crash may have created, say) stops it for you to look
-at. A completed setup run again reports `already_complete` and does not touch
-an edited handbook.
-
-Exit codes of a plan: 0 proposed, 2 invalid or failed, 3 review required. Of
-an apply: 0 done or already done, 2 failed.
-
-To take a Pond or the whole site away again: [OPERATIONS](OPERATIONS.md).
+Exit codes are 0 for success or valid preview, and 2 for invalid/failed work.
+Provisioning also returns 3 when the plan requires review.
 
 ## Reference: a default site
 
-`site/default/` holds every file steps 2 and 3 write for the wizard's default
-answers (accounts `boring-crocodile` and `boring-crocodile-mcp`, home
-`/home/boring-crocodile`), at the paths they are written to (`two-ponds/`: with
-a second Pond). It is generated (`site/default/generate.py`), and
-`tests/test_site_default.py` fails when it and the renderer drift apart. On a
-real host the UIDs, the `profile_id`, the URL and the memory ceiling (a
-quarter of RAM, 512 MiB to 8 GiB) differ.
+`site/default/` is generated from default inputs; `two-ponds/` adds
+a second Pond. `site/default/generate.py` owns those files and
+`tests/test_site_default.py` checks them. Real numeric identities, UUIDs,
+URL and memory ceiling differ. Start an installation with
+[Getting started](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/getting-started.md).

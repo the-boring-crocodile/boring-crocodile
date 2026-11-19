@@ -34,20 +34,18 @@ class SiteDefaultTests(unittest.TestCase):
                    for p in (DEFAULT / top).rglob("*") if p.is_file()}
         self.assertEqual(present, set(self.expected))
 
-    def test_config_loads(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.toml"
-            path.write_text(self.expected["etc/boring-crocodile/config.toml"])
-            config = Settings.load(path)
-        self.assertEqual(sorted(config.ponds), ["pond"])
-        self.assertEqual(config.ponds["pond"].welcome_file, "WELCOME.md")
-
-    def test_two_pond_config_loads(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.toml"
-            path.write_text(self.expected["two-ponds/etc/boring-crocodile/config.toml"])
-            config = Settings.load(path)
-        self.assertEqual(sorted(config.ponds), ["pond", "second"])
+    def test_both_site_descriptions_load_from_all_their_files(self) -> None:
+        for prefix, names in (("", ["pond"]), ("two-ponds/", ["pond", "second"])):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as tmp:
+                base = prefix + "etc/boring-crocodile/"
+                for relative, body in self.expected.items():
+                    if relative.startswith(base):
+                        path = Path(tmp) / relative.removeprefix(base)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(body)
+                config = Settings.load(Path(tmp) / "config.toml")
+                self.assertEqual(sorted(config.ponds), names)
+                self.assertEqual(config.ponds["pond"].welcome_file, "WELCOME.md")
 
 
 if __name__ == "__main__":

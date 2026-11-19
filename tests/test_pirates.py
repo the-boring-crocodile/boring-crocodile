@@ -18,10 +18,10 @@ from boring_crocodile import pirates
 from boring_crocodile.task_tools import PirateJob
 from boring_worker_kit.inputs import MAX_JOB_SECONDS
 from boring_worker_kit.host_limits import HostLimits
-from boring_crocodile.outcomes import Refusal, RefusalError
+from boring_crocodile.outcomes import Refused, RefusalError
 from boring_crocodile.pirates import Pirates
 from boring_crocodile.pirates import encode
-from boring_crocodile.settings import EnvironmentSettings
+from boring_crocodile.settings import EnvironmentSettings, PirateCaller
 from boring_crocodile.worker import WorkerServer
 from boring_crocodile.worker_client import WorkerClient
 
@@ -56,10 +56,14 @@ class FakePirate:
                 reply = {"ok": True, "result": {"flavour": request["flavour"], "model": "test"}}
             elif self.mode == "result":
                 reply = {"ok": True, "result": {"answer": self.answer}}
+            elif self.mode == "outcome":
+                reply = {"ok": False, "outcome": self.outcome}
             elif self.mode == "busy":
-                reply = {"ok": False, "error": {"code": "busy", "message": "flavour is busy"}}
+                reply = {"ok": False, "outcome": {"status": "refused", "code": "busy", "message": "flavour is busy"}}
             elif self.mode == "failure":
-                reply = {"ok": False, "failure": "provider crashed"}
+                reply = {"ok": False, "outcome": {"status": "failed", "code": "provider_problem", "message": "provider crashed"}}
+            elif self.mode == "bad_reply":
+                reply = self.bad_reply
             elif self.mode == "drop":
                 return
             else:  # hold: answer only when the worker hangs up
@@ -83,7 +87,8 @@ class PirateRegistrationTest(unittest.IsolatedAsyncioTestCase):
         self.pirate = FakePirate(self.root / "pirate.sock")
         await self.pirate.start()
         self.now = 100.0
-        self.pirates = Pirates(Registry(clock=lambda: self.now))
+        self.pirates = Pirates(Registry(clock=lambda: self.now), pond="pond",
+                               callers={ME: PirateCaller(os.getuid(), ("pond",))})
         # Real SO_PEERCRED and NSS membership in our own primary group.
         group = patch.object(pirates, "REGISTRATION_GROUP", grp.getgrgid(os.getgid()).gr_name)
         group.start()
@@ -101,7 +106,7 @@ class PirateRegistrationTest(unittest.IsolatedAsyncioTestCase):
         reader, writer = await asyncio.open_unix_connection(self.root / "register.sock")
         try:
             writer.write(encode({"operation": "register", "kind": "pirate", "flavour": "default",
-                                 "socket_path": str(self.pirate.path), **change}))
+                                 "socket_path": str(self.pirate.path), "version": "0.4.0", **change}))
             await writer.drain()
             return json.loads(await reader.readline())
         finally:
@@ -110,7 +115,8 @@ class PirateRegistrationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_registration_names_the_account_and_the_heartbeat_follows_it(self):
         self.assertEqual(await self.register(),
-                         {"ok": True, "result": {"ping_interval_seconds": 3.0}})
+                         {"ok": True, "result": {"ping_interval_seconds": 3.0,
+                          "accepted": True, "pond": "pond", "pirate": ME}})
         entry = self.pirates.registry.get(f"{ME}/default")
         self.assertEqual(entry.details, {"pirate": ME, "flavour": "default",
                                          "socket_path": str(self.pirate.path),
@@ -145,14 +151,44 @@ class PirateRegistrationTest(unittest.IsolatedAsyncioTestCase):
                 finally:
                     writer.close()
                     await writer.wait_closed()
-                self.assertEqual(reply["error"]["code"], "invalid_request")
+                self.assertEqual(reply["outcome"]["code"], "invalid_request")
         self.assertEqual(self.pirates.list(), {"pirates": []})
+
+    async def test_foreign_socket_peer_is_warned_and_refused_before_sending(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        writer = SimpleNamespace(write=Mock(), close=Mock(), wait_closed=AsyncMock())
+        with patch.object(pirates.asyncio, "open_unix_connection",
+                          AsyncMock(return_value=(object(), writer))), \
+                patch.object(pirates, "peer_uid", return_value=os.getuid() + 1), \
+                self.assertLogs("boring_crocodile.pirates", "WARNING") as logs:
+            with self.assertRaises(Refused) as caught:
+                await pirates.exchange("fixture.sock", os.getuid(), {"operation": "ping"}, 1)
+        self.assertEqual(caught.exception.code, "forbidden")
+        self.assertIn("Pirate socket peer UID mismatch", " ".join(logs.output))
+        writer.write.assert_not_called()
+        writer.close.assert_called_once()
+
+    async def test_connection_reset_after_write_keeps_unknown_effects(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from boring_outcomes import Failed
+        writer = SimpleNamespace(write=Mock(), drain=AsyncMock(side_effect=ConnectionResetError("reset")),
+                                 close=Mock(), wait_closed=AsyncMock())
+        with patch.object(pirates.asyncio, "open_unix_connection",
+                          AsyncMock(return_value=(object(), writer))), \
+                patch.object(pirates, "peer_uid", return_value=os.getuid()):
+            with self.assertRaises(Failed) as caught:
+                await pirates.exchange("fixture.sock", os.getuid(), {"operation": "ping"}, 1)
+        self.assertEqual((caught.exception.code, caught.exception.details["effects"]),
+                         ("unavailable", "unknown"))
+        writer.write.assert_called_once()
 
     async def test_bad_flavours_are_refused(self):
         for flavour in ("Default", "-x", "a" * 64, "", "a/b", 7):
             with self.subTest(flavour=flavour):
                 reply = await self.register(flavour=flavour)
-                self.assertEqual(reply["error"]["code"], "invalid_request")
+                self.assertEqual(reply["outcome"]["code"], "invalid_request")
         self.assertEqual(self.pirates.list(), {"pirates": []})
 
     async def test_socket_must_be_an_own_socket_by_absolute_path(self):
@@ -164,18 +200,47 @@ class PirateRegistrationTest(unittest.IsolatedAsyncioTestCase):
                            (str(self.root / "file"), "invalid_request"),
                            (str(link), "invalid_request")):
             with self.subTest(path=path):
-                self.assertEqual((await self.register(socket_path=path))["error"]["code"], code)
+                self.assertEqual((await self.register(socket_path=path))["outcome"]["code"], code)
         # A socket owned by another account than the registering one.
         root_account = {"operation": "register", "kind": "pirate", "flavour": "default",
                         "socket_path": str(self.pirate.path)}
-        with self.assertRaises(Refusal) as caught:
+        with self.assertRaises(Refused) as caught:
             self.pirates.register(0, root_account)
         self.assertEqual(caught.exception.code, "forbidden")
         self.assertEqual(self.pirates.list(), {"pirates": []})
 
+
+    async def test_registration_permission_denied_is_typed_and_logged_without_traceback(self):
+        denied = PermissionError(13, "Permission denied", str(self.pirate.path))
+        with patch.object(self.pirates, "register", side_effect=denied), \
+                self.assertLogs("boring_crocodile.pirates", "WARNING") as logs:
+            reply = await self.register()
+        self.assertEqual(reply["outcome"]["status"], "refused")
+        self.assertEqual(reply["outcome"]["code"], "forbidden")
+        self.assertIn("Permission denied", reply["outcome"]["message"])
+        self.assertIn("forbidden", "\\n".join(logs.output))
+        self.assertTrue(all(record.exc_info is None for record in logs.records))
+        self.assertEqual(self.pirates.list(), {"pirates": []})
+
+    async def test_registration_failure_is_logged_and_does_not_claim_refusal(self):
+        with patch.object(self.pirates, "register", side_effect=ValueError("PRIVATE-REGISTRATION")), \
+                self.assertLogs("boring_crocodile.pirates", "ERROR") as logs:
+            reply = await self.register()
+        self.assertEqual(reply, {"ok": False, "outcome": {
+            "status": "failed", "code": "registration_failed",
+            "message": "ValueError: The Registration failed; see its log for details.",
+            "component": "registration", "effects": "unknown"}})
+        self.assertIn("PRIVATE-REGISTRATION", "\n".join(logs.output))
+
+    async def test_registration_preserves_typed_failure_details(self):
+        from boring_outcomes import Failed
+        error = Failed("upstream_error", "registry failed", detail={"retry": [1, None]})
+        with patch.object(self.pirates, "register", side_effect=error):
+            self.assertEqual(await self.register(), {"ok": False, "outcome": error.as_data()})
+
     async def test_unknown_registration_fields_are_refused(self):
         reply = await self.register(profile="review")
-        self.assertEqual(reply["error"]["code"], "invalid_request")
+        self.assertEqual(reply["outcome"]["code"], "invalid_request")
 
 
 class PirateJobTest(unittest.IsolatedAsyncioTestCase):
@@ -187,12 +252,12 @@ class PirateJobTest(unittest.IsolatedAsyncioTestCase):
             "pond", "Pond", self.root / "worker.sock", self.root, (self.root,),
             os.getuid(), 128, self.root / "task.sock")
         with patch("boring_crocodile.worker.read_host_limits", return_value=HostLimits(2, 290)):
-            self.worker = WorkerServer(self.settings)
+            self.worker = WorkerServer(self.settings, pirate_callers={ME: PirateCaller(os.getuid(), ("pond",))})
         self.pirate = FakePirate(self.root / "pirate.sock")
         await self.pirate.start()
         self.worker.pirates.register(os.getuid(), {
             "operation": "register", "kind": "pirate", "flavour": "default",
-            "socket_path": str(self.pirate.path)})
+            "socket_path": str(self.pirate.path), "version": "0.4.0"})
         self.server = await asyncio.start_unix_server(self.worker.handle, self.settings.socket_path)
         self.client = WorkerClient({"pond": self.settings})
 
@@ -231,22 +296,51 @@ class PirateJobTest(unittest.IsolatedAsyncioTestCase):
         self.pirate.answer = "x" * pirates.MAX_FRAME
         _, output = await self.run_job()
         self.assertEqual(output["state"], "failed")
-        self.assertIn("exceeds the frame limit of 1048576 bytes", output["result"]["error"])
+        self.assertIn("exceeds the frame limit of 1048576 bytes", output["result"]["failure"]["message"])
+
+    async def test_new_pirate_outcomes_survive_the_socket_and_job_store(self):
+        self.pirate.mode = "outcome"
+        for status, state, key in (("refused", "refused", "refusal"), ("failed", "failed", "failure")):
+            self.pirate.outcome = {"status": status, "code": "provider_problem",
+                                   "message": "explanation", "vendor_code": "VENDOR",
+                                   "retry_after_seconds": 3, "nested": {"items": [1, None]}}
+            with self.subTest(status=status):
+                _, output = await self.run_job()
+                self.assertEqual(output["state"], state)
+                self.assertEqual(output["result"], {key: self.pirate.outcome})
 
     async def test_pirate_refusal_is_the_jobs_outcome(self):
         self.pirate.mode = "busy"
         _, output = await self.run_job()
         self.assertEqual(output["state"], "refused")
-        self.assertEqual(output["result"], {"refusal": {"code": "busy", "message": "flavour is busy"}})
+        self.assertEqual(output["result"], {"refusal": {"status": "refused", "code": "busy", "message": "flavour is busy"}})
 
     async def test_dropped_connection_and_pirate_failure_fail_the_job(self):
         for mode, text in (("drop", "closed the connection before answering"),
-                           ("failure", "the Pirate reported a failure: provider crashed")):
+                           ("failure", "provider crashed")):
             with self.subTest(mode=mode):
                 self.pirate.mode = mode
                 _, output = await self.run_job()
                 self.assertEqual(output["state"], "failed")
-                self.assertIn(text, output["result"]["error"])
+                self.assertIn(text, output["result"]["failure"]["message"])
+                self.assertEqual(output["result"]["failure"]["code"],
+                                 "unavailable" if mode == "drop" else "provider_problem")
+                if mode == "drop":
+                    self.assertEqual(output["result"]["failure"]["effects"], "unknown")
+
+    async def test_unexpected_pirate_envelopes_fail_without_echoing_payloads(self):
+        for reply in ({"ok": None, "result": "PRIVATE-PAYLOAD"},
+                      {"ok": True, "result": "PRIVATE-PAYLOAD"},
+                      {"ok": False, "outcome": {"status": "PRIVATE-PAYLOAD"}}):
+            with self.subTest(reply=reply):
+                self.pirate.mode, self.pirate.bad_reply = "bad_reply", reply
+                _, output = await self.run_job()
+                self.assertEqual(output["state"], "failed")
+                failure = output["result"]["failure"]
+                self.assertEqual((failure["code"], failure["component"], failure["effects"]),
+                                 ("bad_reply", "pirate", "unknown"))
+                self.assertEqual(failure["message"], "invalid Pirate response envelope")
+                self.assertNotIn("PRIVATE-PAYLOAD", failure["message"])
 
     async def test_job_stop_closes_connection_without_claiming_remote_cleanup(self):
         self.pirate.mode = "hold"
@@ -261,7 +355,7 @@ class PirateJobTest(unittest.IsolatedAsyncioTestCase):
         waited = await self.client.job_wait("pond", [started["job_id"]], 5)
         self.assertEqual(waited["jobs"][0]["state"], "failed")
         output = await self.client.job_action("pond", "job_output", started["job_id"])
-        self.assertIn("remote cleanup unconfirmed", output["result"]["error"])
+        self.assertIn("remote cleanup unconfirmed", output["result"]["failure"]["message"])
         self.assertEqual(len(self.pirate.requests), 1)  # never replay after uncertainty
 
     async def test_unknown_or_unavailable_flavour_is_refused_before_a_job_exists(self):
@@ -295,7 +389,7 @@ class PirateJobTest(unittest.IsolatedAsyncioTestCase):
             "overrides": overrides})
         await self.client.job_wait("pond", [started["job_id"]], 5)
         self.assertEqual(self.pirate.requests[-1]["overrides"], overrides)
-        for given in ({}, {"overrides": None}):  # absent on the wire: an older Pirate still runs it
+        for given in ({}, {"overrides": None}):
             with self.subTest(given=given):
                 await self.run_job() if not given else await self.client.job_wait("pond", [(
                     await self.client.job_start("pond", None, None, None, pirate={
@@ -349,7 +443,7 @@ class PirateJobTest(unittest.IsolatedAsyncioTestCase):
             await self.client.pirate_describe("pond", ME, "nope")
         self.assertEqual(caught.exception.code, "not_found")
         # The carried budget bounds the whole exchange; none left is refused before connecting.
-        with self.assertRaises(Refusal) as refused:
+        with self.assertRaises(Refused) as refused:
             await self.worker.pirates.describe(ME, "default", 0)
-        self.assertEqual(refused.exception.code, "limit")
+        self.assertEqual(refused.exception.code, "not_admitted")
         self.assertEqual(len(self.pirate.requests), 1)  # nothing more was sent

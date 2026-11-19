@@ -5,9 +5,10 @@ After=systemd-tmpfiles-setup.service local-fs.target boring-crocodile-task-@POND
 
 [Service]
 Type=simple
+Slice=@BUDGET@
 User=@EXECUTION_USER@
 Group=@EXECUTION_USER@
-UMask=0007
+UMask=0027
 ExecStart=@RUNTIME@/bin/boring-crocodile-worker --config /etc/boring-crocodile/config.toml --environment @POND@
 Restart=on-failure
 RestartSec=2

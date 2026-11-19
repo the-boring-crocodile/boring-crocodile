@@ -28,7 +28,7 @@ from boring_worker_kit.execution import EnvironmentExecutor, prepare_command
 from boring_worker_kit.inputs import MAX_JOB_SECONDS
 from .settings import EnvironmentSettings
 from boring_worker_kit.observation import Observation
-from .outcomes import Refusal
+from .outcomes import Refused, failure_data
 
 if TYPE_CHECKING:
     from .batch import BatchRunner
@@ -63,17 +63,21 @@ class ManagedJobs:
         if root.is_symlink() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o077:
             raise PermissionError("job state directory must be private to the environment")
         self.store = ReceiptStore(root / "jobs.sqlite3", "jobs")
-        self.store.mark_unfinished()
+        try:
+            self.store.mark_unfinished()
+        except BaseException:
+            self.store.close()
+            raise
         self.running: dict[str, asyncio.Task] = {}
         self.observers: dict[str, Observation] = {}
         self.partial_output: dict[str, dict[str, object]] = {}
 
     def _row(self, job_id: str) -> tuple:
         if not isinstance(job_id, str) or not JOB_ID.fullmatch(job_id):
-            raise Refusal("invalid_request", "job_id must be the 32-character id job_start returned")
+            raise Refused("invalid_request", "job_id must be the 32-character id job_start returned")
         row = self.store.get(job_id)
         if row is None:
-            raise Refusal("not_found", "unknown job")
+            raise Refused("not_found", "unknown job")
         return row
 
     def _public(self, row: tuple, include_output: bool = False) -> dict:
@@ -105,12 +109,12 @@ class ManagedJobs:
         status carries the server-minted `job_id`.
         """
         if sum(payload is not None for payload in (command, operations, pirate)) != 1:
-            raise Refusal("invalid_request", "exactly one of command, operations or pirate is required")
+            raise Refused("invalid_request", "exactly one of command, operations or pirate is required")
         if pirate is not None:
             if self.pirates is None:
                 raise RuntimeError("this worker cannot run Pirate jobs")
             if cwd is not None or timeout is not None:
-                raise Refusal("invalid_request",
+                raise Refused("invalid_request",
                               "a Pirate job takes its timeout inside pirate, and no cwd")
             target = self.pirates.prepare_run(pirate)
             run_request: dict[str, object] = {"pirate": target}
@@ -123,7 +127,7 @@ class ManagedJobs:
             self.batch.prepare({"operations": operations, "on_error": on_error})
             effective_timeout = DEFAULT_JOB_SECONDS if timeout is None else float(timeout)
             if not 0.1 <= effective_timeout <= MAX_JOB_SECONDS:
-                raise Refusal("invalid_request",
+                raise Refused("invalid_request",
                               f"timeout_seconds must be 0.1 to {MAX_JOB_SECONDS:g}")
             run_request = {
                 "operations": operations, "on_error": on_error, "timeout": effective_timeout}
@@ -140,7 +144,7 @@ class ManagedJobs:
         # One shared pool: command, operations and Pirate jobs are rows in
         # the same table, counted together against the one MAX_UNFINISHED.
         if self.store.count(UNFINISHED_STATES) >= MAX_UNFINISHED:
-            raise Refusal("limit", "too many unfinished jobs")
+            raise Refused("limit", "too many unfinished jobs")
         row = self.store.create("queued")
         job_id = row[0]
         observer = Observation(self.settings, "job:" + job_id, "worker", job_id=job_id)
@@ -193,7 +197,7 @@ class ManagedJobs:
             result = ({**snapshot_result, "output_incomplete": True, "cancelled": True}
                       if snapshot_result else {"cancelled": True})
             state = "cancelled"
-        except Refusal as refusal:
+        except Refused as refusal:
             # The job's work was refused (not admitted, or the Pirate said
             # busy, ...): it did not run. Keep the refusal as data, with its
             # code (a Pirate's passed through), in the job's result.
@@ -204,7 +208,7 @@ class ManagedJobs:
         except Exception as error:
             snapshot_result = self.partial_output.get(job_id)
             result = {**snapshot_result, "output_incomplete": True} if snapshot_result else {}
-            result["error"] = f"{type(error).__name__}: {error}"[:1024]
+            result["failure"] = failure_data(error)
             state = "failed"
         finally:
             self.store.update(job_id, state=state, result=result)
@@ -215,8 +219,8 @@ class ManagedJobs:
                 details: dict[str, object] = {}
                 if state == "completed" and is_command:
                     details["exit_code"] = result.get("exit_code")
-                if state == "failed" and "error" in result:
-                    details["error"] = result["error"][:1024]
+                if state == "failed" and "failure" in result:
+                    details["failure"] = result["failure"]
                 if state == "refused":
                     details["refusal"] = result["refusal"]
                 observer.emit("job_state", state=state, **details)
@@ -246,10 +250,10 @@ class ManagedJobs:
         error: call again, never start the work again.
         """
         if (not isinstance(job_ids, list) or not job_ids or len(job_ids) > MAX_WAIT_JOBS):
-            raise Refusal("invalid_request", f"job_ids must list 1 to {MAX_WAIT_JOBS} job ids")
+            raise Refused("invalid_request", f"job_ids must list 1 to {MAX_WAIT_JOBS} job ids")
         if (type(wait_seconds) not in (int, float) or not math.isfinite(wait_seconds)
                 or wait_seconds < 0):
-            raise Refusal("invalid_request", "wait_seconds must be zero or a finite positive number")
+            raise Refused("invalid_request", "wait_seconds must be zero or a finite positive number")
         loop = asyncio.get_running_loop()
         started = loop.time()
         owners = {self.running[job_id] for job_id in job_ids
@@ -260,7 +264,7 @@ class ManagedJobs:
         def check(job_id: object) -> dict:
             try:
                 return self.status(job_id)
-            except Refusal as refusal:
+            except Refused as refusal:
                 return {"job_id": job_id, "refusal": refusal.as_data()}
 
         jobs = [check(job_id) for job_id in job_ids]
